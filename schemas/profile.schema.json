@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "calibration_status": {
+      "type": "string"
+    },
+    "default_threshold": {
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "dimensions": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "dtype": {
+      "type": "string"
+    },
+    "family": {
+      "type": "string"
+    },
+    "manifest": true,
+    "name": {
+      "type": "string"
+    },
+    "profile_id": {
+      "type": "string"
+    },
+    "requires_model": {
+      "type": "boolean"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "profile_id",
+    "name",
+    "family",
+    "dimensions",
+    "dtype",
+    "status",
+    "calibration_status",
+    "requires_model",
+    "manifest"
+  ],
+  "title": "Profile",
+  "type": "object"
+}

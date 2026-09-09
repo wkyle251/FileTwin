@@ -1,0 +1,51 @@
+# Build output, downloaded models/runtimes, and local scan data.
+/target/
+/.filetwin/
+/models/
+/reports/
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Databases may contain source paths, file metadata, and vectors.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+
+# Private conversation history and machine-specific files.
+/conversation.md
+.DS_Store
+__pycache__/
+.idea/
+.vscode/
+
+# Local credentials and private keys. Examples must contain placeholders only.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.aws/
+.ssh/
+.netrc
+.pypirc
+credentials*.json
+secrets*.json
+secrets*.toml
+secrets*.yaml
+secrets*.yml
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ecdsa
+id_ed25519

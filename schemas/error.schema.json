@@ -1,0 +1,84 @@
+{
+  "$defs": {
+    "ErrorCode": {
+      "enum": [
+        "invalid_request",
+        "unsupported_schema_version",
+        "unsupported_provider",
+        "unsupported_capability",
+        "experimental_profile_required",
+        "unknown_profile",
+        "threshold_required",
+        "cache_busy",
+        "engine_busy",
+        "not_found",
+        "invalid_cursor",
+        "results_not_ready",
+        "database_version_unsupported",
+        "database_corrupt",
+        "storage_error",
+        "io_error",
+        "resource_budget_too_small",
+        "budget_exhausted",
+        "source_changed",
+        "unsupported_format",
+        "unselected_family",
+        "invalid_text",
+        "insufficient_content",
+        "runtime_unavailable",
+        "model_integrity",
+        "decode_failed",
+        "worker_failed",
+        "worker_timeout",
+        "strict_consistency_unavailable",
+        "result_expired",
+        "record_too_large",
+        "output_closed",
+        "cancelled",
+        "internal_error"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/ErrorCode"
+    },
+    "details": true,
+    "fatal": {
+      "type": "boolean"
+    },
+    "file_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "type": "string"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "source_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stage": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "code",
+    "stage",
+    "retryable",
+    "fatal",
+    "message",
+    "details"
+  ],
+  "title": "Error",
+  "type": "object"
+}

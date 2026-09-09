@@ -1,0 +1,34 @@
+[package]
+name = "filetwin-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Local content similarity engine and persistent result catalog"
+
+[features]
+default = []
+bundled-sqlite = ["rusqlite/bundled"]
+
+[dependencies]
+base64.workspace = true
+crossbeam-channel.workspace = true
+csv.workspace = true
+fs2.workspace = true
+globset.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+time.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

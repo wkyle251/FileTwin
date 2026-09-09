@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "request_id": "example-text-scan",
+  "operation": "scan",
+  "sources": [{"provider": "local", "root": "/absolute/path/to/your/text"}],
+  "profiles": {"text": "sha256:40f4a1dbbfa0ea59b1206c74b3ba0bd058d53689220ba8a00bffecf8c9464d40"},
+  "matching": {
+    "threshold_overrides": {
+      "sha256:40f4a1dbbfa0ea59b1206c74b3ba0bd058d53689220ba8a00bffecf8c9464d40": 0.7
+    }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "items": {
+      "items": true,
+      "type": "array"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "next_cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "snapshot_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "snapshot_id",
+    "result_revision",
+    "kind",
+    "items"
+  ],
+  "title": "ResultPage",
+  "type": "object"
+}
