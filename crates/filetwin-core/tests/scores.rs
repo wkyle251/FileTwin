@@ -41,6 +41,67 @@ fn scores(run: &str) -> ResultsQuery {
 }
 
 #[test]
+fn progress_counts_include_cache_failures_exclusions_and_hash_only_candidates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("input");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "First valid text observation.").unwrap();
+    fs::hard_link(root.join("a.txt"), root.join("alias.txt")).unwrap();
+    fs::write(root.join("b.txt"), "Second distinct text observation.").unwrap();
+    for name in ["opaque-a.bin", "opaque-b.bin"] {
+        fs::write(root.join(name), b"\0\xffopaque bytes").unwrap();
+    }
+    fs::write(root.join("unselected.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    std::os::unix::fs::symlink("a.txt", root.join("link.txt")).unwrap();
+    let data = tmp.path().join("data");
+    let engine = Engine::open(EngineConfig::new(&data), HostServices::default()).unwrap();
+    let catalog = Catalog::open_read_only(&data).unwrap();
+    let mut request = JobRequest::text_scores([root]);
+    request.exact_duplicates = Some(ExactDuplicates::Compute);
+    for cached in [false, true] {
+        let saved = engine.submit(request.clone()).unwrap().wait().unwrap();
+        assert_eq!(saved.status, "completed");
+        assert_eq!(saved.counts.files_processed, 6);
+        assert_eq!(saved.counts.files_total, Some(6));
+        assert_eq!(saved.counts.files_discovered, 6);
+        assert_eq!(saved.counts.files_ready, 2);
+        assert_eq!(saved.counts.files_failed, 2);
+        assert_eq!(saved.counts.files_excluded, 2);
+        assert_eq!(saved.counts.locations, 7);
+        assert_eq!(saved.counts.vectors_encoded, if cached { 0 } else { 2 });
+        assert_eq!(saved.counts.cache_hits, if cached { 2 } else { 0 });
+        assert_eq!(saved.counts.pairs_processed, 10);
+        assert_eq!(saved.counts.pairs_total, Some(10));
+        assert_eq!(saved.counts.pairs_compared, 1);
+        assert_eq!(saved.counts.scores_retained, 1);
+        assert_eq!(saved.counts.exact_pairs, 1);
+        let status = catalog
+            .status(StatusQuery {
+                schema_version: 1,
+                job_id: saved.job_id.clone(),
+                request_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            status["counts"],
+            serde_json::to_value(&saved.counts).unwrap()
+        );
+        let grouped = engine
+            .submit(grouping(saved.run_id.as_deref().unwrap(), -1.0))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(grouped.counts.files_processed, 6);
+        assert_eq!(grouped.counts.files_total, Some(6));
+        assert_eq!(grouped.counts.pairs_processed, 0);
+        assert_eq!(grouped.counts.pairs_total, None);
+        assert_eq!(grouped.counts.scores_reused, 1);
+        assert_eq!(grouped.counts.scores_total, Some(1));
+        assert_eq!(grouped.counts.exact_pairs, 1);
+    }
+}
+
+#[test]
 fn every_score_survives_and_groups_reuse_evidence_without_vectors() {
     let (tmp, root, engine, catalog) = fixture();
     let saved = engine
@@ -228,6 +289,8 @@ fn zero_and_negative_scores_are_numbers_and_partial_scores_are_null() {
         .wait()
         .unwrap();
     assert_eq!(partial.exit_code(), 3);
+    assert_eq!(partial.counts.pairs_processed, 0);
+    assert_eq!(partial.counts.pairs_total, Some(3));
     let run = partial.run_id.unwrap();
     let matrix = catalog.matrix(MatrixQuery::new(&run)).unwrap();
     assert_eq!(matrix.scores[0][1], None);
@@ -250,6 +313,11 @@ fn unavailable_files_and_scope_exclusions_are_not_zero_similarity() {
     let saved = engine.submit(request).unwrap().wait().unwrap();
     assert_eq!(saved.counts.files_ready, 2);
     assert_eq!(saved.counts.scores_retained, 0);
+    assert_eq!(saved.counts.files_processed, 3);
+    assert_eq!(saved.counts.files_total, Some(3));
+    assert_eq!(saved.counts.pairs_processed, 3);
+    assert_eq!(saved.counts.pairs_total, Some(3));
+    assert_eq!(saved.counts.pairs_compared, 0);
     let run = saved.run_id.unwrap();
     let matrix = catalog.matrix(MatrixQuery::new(&run)).unwrap();
     let failed = matrix
@@ -280,6 +348,7 @@ fn unavailable_files_and_scope_exclusions_are_not_zero_similarity() {
     assert_eq!(grouped.counts.files_failed, saved.counts.files_failed);
     assert_eq!(grouped.exit_code(), 3);
     assert_eq!(grouped.counts.groups, 0);
+    assert_eq!(grouped.counts.scores_total, Some(0));
     assert!(
         !catalog
             .results(ResultsQuery {
@@ -414,22 +483,31 @@ fn old_indexes_upgrade_without_changing_existing_results() {
     let mut counts = serde_json::to_value(&saved.counts).unwrap();
     counts.as_object_mut().unwrap().remove("scores_retained");
     counts.as_object_mut().unwrap().remove("scores_reused");
+    for field in [
+        "files_processed",
+        "files_total",
+        "pairs_processed",
+        "pairs_total",
+        "scores_total",
+    ] {
+        counts.as_object_mut().unwrap().remove(field);
+    }
     db.execute(
         "UPDATE jobs SET request=?2,counts=?3 WHERE id=?1",
         params![saved.job_id, request.to_string(), counts.to_string()],
     )
     .unwrap();
     let reader = Catalog::open_read_only(tmp.path().join("data")).unwrap();
-    assert_eq!(
-        reader
-            .status(StatusQuery {
-                schema_version: 1,
-                job_id: saved.job_id,
-                request_id: None
-            })
-            .unwrap()["counts"]["scores_retained"],
-        0
-    );
+    let status = reader
+        .status(StatusQuery {
+            schema_version: 1,
+            job_id: saved.job_id,
+            request_id: None,
+        })
+        .unwrap();
+    assert_eq!(status["counts"]["scores_retained"], 0);
+    assert_eq!(status["counts"]["files_processed"], 3);
+    assert!(status["counts"]["files_total"].is_null());
     assert_eq!(
         reader
             .matrix(MatrixQuery::new(saved.run_id.clone().unwrap()))
@@ -510,6 +588,8 @@ fn cancelled_scoring_and_grouping_resume_without_duplicate_evidence() {
     let complete = engine.resume(scoring.id()).unwrap().wait().unwrap();
     let total = 120 * 119 / 2;
     assert_eq!(complete.counts.scores_retained, total);
+    assert_eq!(complete.counts.pairs_processed, total);
+    assert_eq!(complete.counts.pairs_total, Some(total));
     assert_eq!(catalog.matrix(old_query).unwrap().scores, old);
     let group = engine
         .submit(grouping(complete.run_id.as_deref().unwrap(), 1.0))
@@ -524,6 +604,7 @@ fn cancelled_scoring_and_grouping_resume_without_duplicate_evidence() {
             })
             .unwrap();
         if status["counts"]["scores_reused"].as_u64().unwrap() >= 64 {
+            assert_eq!(status["counts"]["scores_total"], total);
             group.cancel();
             break;
         }
@@ -537,6 +618,7 @@ fn cancelled_scoring_and_grouping_resume_without_duplicate_evidence() {
     let resumed = engine.resume(group.id()).unwrap().wait().unwrap();
     assert_eq!(resumed.status, "completed");
     assert_eq!(resumed.counts.scores_reused, total);
+    assert_eq!(resumed.counts.scores_total, Some(total));
     assert_eq!(resumed.counts.pairs_compared, 0);
     assert!(resumed.result_bytes_used >= interrupted.result_bytes_used);
     drop(tmp);

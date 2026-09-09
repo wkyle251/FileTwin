@@ -217,10 +217,26 @@ fn cancellation_kills_native_descendants_and_removes_staging() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    let events = job.events();
+    loop {
+        match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+            JobEvent::Progress { data, .. } => {
+                assert_eq!(data["stage"], "discovery");
+                assert_eq!(data["counts"]["files_processed"], 0);
+                assert!(data["counts"]["files_total"].is_null());
+                assert!(data["counts"]["pairs_total"].is_null());
+                break;
+            }
+            JobEvent::Summary(_) => panic!("Native fixture finished before cancellation"),
+            _ => (),
+        }
+    }
     job.cancel();
     let summary = job.wait().unwrap();
     assert_eq!(summary.status, "cancelled");
     assert_eq!(summary.counts.files_ready, 0);
+    assert_eq!(summary.counts.files_processed, 0);
+    assert_eq!(summary.counts.files_total, None);
     assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
     // A killed descendant can be briefly visible as a zombie until the system
     // reaper observes it. It must never continue running after cancellation.

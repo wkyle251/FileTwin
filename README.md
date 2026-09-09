@@ -34,9 +34,10 @@ cargo build --locked --release -p filetwin-cli
 ```
 
 For all four encoding families, build the companion worker and explicitly
-provision the selected SSCD model, ONNX Runtime and PDFium. Python/PyTorch are
-used only to convert the model during setup. Production processing uses Rust,
-the native libraries and FFmpeg; it never downloads anything.
+provision the selected SSCD model, ONNX Runtime and PDFium. Python 3 runs the
+setup script; PyTorch is needed only to convert the model during setup. The CLI,
+core library and companion worker are written in Rust. Production processing
+uses the native libraries and FFmpeg without invoking Python or downloading assets.
 
 ```sh
 cargo build --locked --release --workspace
@@ -56,8 +57,11 @@ python3 scripts/setup-native.py --model-dir .filetwin/models \
 
 The native assets are installed under `.filetwin/models` by this command.
 `setup-native.py --onnx PATH` can install a previously converted,
-verified artifact without PyTorch. Copy both executables and the provisioned
-model directory when deploying; see [native-encoding.md](native-encoding.md).
+verified artifact without PyTorch; the setup script still requires Python 3.
+The Python smoke, format and parity scripts are developer test tools. Running
+FileTwin with provisioned assets requires no Python installation. Copy both
+executables and the provisioned model directory when deploying; see
+[native-encoding.md](native-encoding.md).
 
 `--experimental` selects the current text/document, image, audio and video
 profiles. Use `--families image,video` to select only those families. A bare
@@ -468,7 +472,7 @@ then run:
 
 ```sh
 ./target/release/filetwin run --request examples/native-scan-request.json \
-  --data-dir .filetwin --format jsonl --non-interactive
+  --data-dir .filetwin --format jsonl --non-interactive --progress-interval-ms 250
 ```
 
 Each machine response has exactly these envelope fields:
@@ -491,6 +495,83 @@ files. JSON emits one terminal response. JSONL emits `accepted`, optional
 progress/errors, then one `summary`. Queries emit one response. Treat an
 accepted event without a summary as incomplete. Inspect both completeness and
 the process exit code; a completed job can have failed or unsupported files.
+
+For live progress, read stdout one line at a time and handle `type: "progress"`.
+`--progress-interval-ms` throttles updates (default 1,000 ms); it does not set a
+guaranteed delivery frequency. Short jobs or stages may finish without a progress
+event. This applies to processing commands such as `scan`, `index`, `compare`,
+`group` and `resume`. Queries such as `matrix` and `results`, and report exports,
+return one response without a progress stream.
+
+An illustrative progress event, with envelope fields and some counters omitted:
+
+```json
+{
+  "type": "progress",
+  "data": {
+    "stage": "comparing",
+    "counts": {
+      "files_processed": 120,
+      "files_total": 120,
+      "files_ready": 120,
+      "vectors_encoded": 120,
+      "pairs_processed": 2000,
+      "pairs_total": 7140,
+      "pairs_compared": 2000,
+      "scores_retained": 2000,
+      "scores_reused": 0,
+      "scores_total": null
+    },
+    "elapsed_seconds": 2.5,
+    "eta_seconds": null
+  }
+}
+```
+
+These raw counters are available in progress events, `status` and terminal
+summaries, and as fields of the Rust `Counts` type:
+
+| Counter | Meaning |
+| --- | --- |
+| `files_processed` | Inventory entries with a recorded ready, failed or excluded outcome; includes cache hits. |
+| `files_total` | Final recorded inventory size; `null` until discovery finishes or a saved snapshot is loaded. |
+| `files_ready`, `files_failed`, `files_excluded` | Outcome breakdown. Failures include unsupported formats and insufficient content. |
+| `vectors_encoded`, `cache_hits` | Encoding work completed and cached vectors reused. |
+| `pairs_processed`, `pairs_total` | Candidate pairs examined and the total candidate work for comparison. |
+| `pairs_compared` | Actual compatible vector comparisons; can be less than `pairs_processed`. |
+| `scores_retained` | Similarity scores saved by an all-scores run. |
+| `scores_reused`, `scores_total` | Saved similarity scores inspected and the total to inspect during a `group` job. Exact-duplicate records are separate. |
+| `bytes_read`, `bytes_hashed` | Source bytes read and hashed; comparison/grouping of saved data does not read originals. |
+
+The current `discovery` stage includes encoding. It visits and processes files
+incrementally, so `files_discovered` is not a final total during a scan.
+Inventory counts share the snapshot's entry semantics: hard-linked file aliases
+share one entry, while excluded paths can include directories and symlinks.
+Errors that prevent recording an entry are reported separately; a known inventory
+size does not imply complete source coverage. On discovery resume, inventory
+counts can reset as directories are relisted; `attempt_id` identifies the attempt.
+
+For `comparing`, callers can calculate `pairs_processed / pairs_total` when the
+total is positive. Candidates are all unique, non-self pairs of snapshot entries
+with a vector or known SHA-256. Processing includes scope/profile skips and
+hash-only checks, so use `pairs_processed` as the numerator. `pairs_total` is
+`null` before comparison is prepared, or for an operation that does no comparison;
+zero means there are no candidates. Saved-score `filtering` provides
+`scores_reused / scores_total`, followed by a separate `grouping` stage.
+
+FileTwin leaves percentages to the calling application. Counters can remain
+unchanged while one file or a grouping step is being processed; there is no
+per-file encoding percentage or ETA (`eta_seconds` is null). Use stage labels
+and counters to display activity, and the terminal summary to determine completion.
+Older published results can omit these newly added counters; their immutable
+payloads are preserved. Resumed comparisons recover candidate progress from
+their stored cursor when the old checkpoint has no `pairs_processed` field.
+
+A caller can also poll durable state using the `job_id` from `accepted`:
+
+```sh
+./target/release/filetwin --data-dir .filetwin status --job JOB_ID --format json
+```
 
 | Exit code | Meaning |
 | ---: | --- |
@@ -522,10 +603,16 @@ For a Rust host, add `filetwin-core` as a path dependency. Enable its
 library. See the runnable [host example](crates/filetwin-core/examples/host.rs):
 
 ```rust
-use filetwin_core::{Engine, HostServices, api::{EngineConfig, JobRequest}};
+use filetwin_core::{Engine, HostServices, api::{EngineConfig, JobEvent, JobRequest}};
 
 let engine = Engine::open(EngineConfig::new(data_dir), HostServices::default())?;
 let handle = engine.submit(JobRequest::text_scan([source_dir], 0.7))?;
+for event in handle.events() {
+    if let JobEvent::Progress { data, .. } = event {
+        // The host can forward these counts to its UI or another API.
+        eprintln!("progress: {data}");
+    }
+}
 let summary = handle.wait()?;
 engine.shutdown()?;
 ```
@@ -533,7 +620,11 @@ engine.shutdown()?;
 Supply absolute `PathBuf` values. `JobRequest::from_json` applies strict JSON
 presence/duplicate validation when embedding a serialized caller. `JobHandle`
 exposes bounded events, cancellation and an authoritative `wait()` result.
-Cloned event receivers compete for messages. `Catalog::open_read_only` permits
+For live updates, consume `handle.events()` while the job runs and handle
+`JobEvent::Progress { data, .. }`; its `data` has the same progress fields shown
+above. Events may be dropped when the bounded queue is full, so use `wait()`
+for the final outcome. Cloned event receivers compete for messages.
+`Catalog::open_read_only` permits
 queries while an engine owns processing; open one catalog per querying thread.
 The library does not inspect CLI configuration/environment, install signals,
 write to standard streams, change directory, or terminate the host. Diagnostic

@@ -556,6 +556,13 @@ fn comparison_resume_keeps_frozen_vectors_and_published_revisions() {
                 if data["stage"] == "comparing"
                     && data["counts"]["pairs_compared"].as_u64().unwrap_or(0) > 0 =>
             {
+                assert_eq!(data["counts"]["files_processed"], 100);
+                assert_eq!(data["counts"]["files_total"], 100);
+                assert_eq!(data["counts"]["pairs_total"], 4950);
+                assert_eq!(
+                    data["counts"]["pairs_processed"],
+                    data["counts"]["pairs_compared"]
+                );
                 handle.cancel();
                 break;
             }
@@ -569,6 +576,8 @@ fn comparison_resume_keeps_frozen_vectors_and_published_revisions() {
     let cancelled = handle.wait().unwrap();
     assert_eq!(cancelled.status, "cancelled");
     assert_eq!(cancelled.result_revision, Some(1));
+    assert_eq!(cancelled.counts.pairs_total, Some(4950));
+    assert!(cancelled.counts.pairs_processed > 0 && cancelled.counts.pairs_processed < 4950);
     let catalog = Catalog::open_read_only(tmp.path().join("data")).unwrap();
     let query = ResultsQuery {
         run_id: cancelled.run_id.clone(),
@@ -577,6 +586,13 @@ fn comparison_resume_keeps_frozen_vectors_and_published_revisions() {
         ..ResultsQuery::default()
     };
     let prior = serde_json::to_value(catalog.results(query.clone()).unwrap()).unwrap();
+    // A pre-progress-counter checkpoint still resumes with the correct candidate
+    // numerator reconstructed from its saved comparison cursor.
+    let db = rusqlite::Connection::open(tmp.path().join("data/index.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE jobs SET counts=json_remove(counts,'$.files_processed','$.files_total','$.pairs_processed','$.pairs_total','$.scores_total') WHERE id=?1",
+        [&cancelled.job_id],
+    ).unwrap();
     fs::remove_dir_all(root).unwrap();
     let finished = engine.resume(&cancelled.job_id).unwrap().wait().unwrap();
     assert_eq!(finished.status, "completed");
@@ -584,6 +600,10 @@ fn comparison_resume_keeps_frozen_vectors_and_published_revisions() {
     assert_eq!(finished.snapshot_id, index.snapshot_id);
     assert_eq!(finished.result_revision, Some(2));
     assert_eq!(finished.counts.pairs_compared, 4950);
+    assert_eq!(finished.counts.files_processed, 100);
+    assert_eq!(finished.counts.files_total, Some(100));
+    assert_eq!(finished.counts.pairs_processed, 4950);
+    assert_eq!(finished.counts.pairs_total, Some(4950));
     assert_eq!(finished.counts.similar_pairs, 4950);
     assert_eq!(finished.counts.bytes_read, 0);
     assert_eq!(finished.counts.groups, 1);

@@ -113,6 +113,10 @@ fn score_matrix_filter_and_group_commands_share_saved_evidence() {
     );
     assert_eq!(code, 0, "{scanned}");
     assert_eq!(scanned["data"]["counts"]["scores_retained"], 3);
+    assert_eq!(scanned["data"]["counts"]["files_processed"], 3);
+    assert_eq!(scanned["data"]["counts"]["files_total"], 3);
+    assert_eq!(scanned["data"]["counts"]["pairs_processed"], 3);
+    assert_eq!(scanned["data"]["counts"]["pairs_total"], 3);
     assert_eq!(scanned["data"]["counts"]["groups"], 0);
     let run = scanned["data"]["run_id"].as_str().unwrap();
     let (code, matrix) = json_output(&data, &["matrix", "--run", run]);
@@ -137,6 +141,10 @@ fn score_matrix_filter_and_group_commands_share_saved_evidence() {
     let (code, grouped) = json_output(&data, &["group", "--run", run, "--threshold", "text=-1"]);
     assert_eq!(code, 0, "{grouped}");
     assert_eq!(grouped["data"]["counts"]["scores_reused"], 3);
+    assert_eq!(grouped["data"]["counts"]["scores_total"], 3);
+    assert_eq!(grouped["data"]["counts"]["files_processed"], 3);
+    assert_eq!(grouped["data"]["counts"]["pairs_processed"], 0);
+    assert!(grouped["data"]["counts"]["pairs_total"].is_null());
     assert_eq!(grouped["data"]["counts"]["pairs_compared"], 0);
     assert_eq!(grouped["data"]["counts"]["bytes_read"], 0);
     assert_eq!(grouped["data"]["counts"]["groups"], 1);

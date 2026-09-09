@@ -109,7 +109,9 @@ be version 9; their full version strings are recorded in file provenance.
 Deploy `filetwin`, its sibling `filetwin-worker`, and the provisioned model/runtime
 directory plus notices. The target-specific runtime libraries differ across
 macOS ARM64, Linux x86-64 and Linux ARM64; the ONNX model is portable. A host can
-use `--onnx` to provision an existing verified model without installing Python.
+use `setup-native.py --onnx PATH` to provision an existing verified model without
+PyTorch or model conversion; Python 3 still runs the setup script. Running the
+deployed binaries with provisioned assets requires no Python installation.
 The source setup never substitutes an artifact if a checksum differs. Signed
 bundles and Ubuntu/minimum-macOS runtime qualification remain release work.
 

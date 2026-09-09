@@ -2449,8 +2449,25 @@ One progress line within a JSONL invocation could be the following; its precedin
 accepted event and subsequent terminal summary are separate lines:
 
 ```jsonl
-{"schema_version":1,"invocation_id":"invocation_stream_example","request_id":"media-review-001","sequence":2,"type":"progress","job_id":"job_example","run_id":null,"data":{"attempt_id":1,"stage":"encoding","files_discovered":2,"files_processed":1,"files_failed":0,"bytes_read":5242880,"bytes_transferred":0,"elapsed_seconds":0.7,"total_files":2,"eta_seconds":null,"checkpoint":null}}
+{"schema_version":1,"invocation_id":"invocation_stream_example","request_id":"media-review-001","sequence":2,"type":"progress","job_id":"job_example","run_id":null,"data":{"attempt_id":1,"stage":"discovery","counts":{"files_discovered":1,"files_processed":1,"files_total":null,"files_ready":1,"files_failed":0,"files_excluded":0,"locations":1,"vectors_encoded":1,"cache_hits":0,"bytes_read":5242880,"bytes_hashed":0,"pairs_processed":0,"pairs_total":null,"pairs_compared":0,"scores_retained":0,"scores_reused":0,"scores_total":null,"similar_pairs":0,"groups":0,"exact_pairs":0},"bytes_transferred":0,"elapsed_seconds":0.7,"eta_seconds":null}}
 ```
+
+In the current preview, `discovery` includes encoding and counts grow as files
+are processed. `files_processed` counts recorded inventory outcomes, including
+cache hits, failures and exclusions. `files_total` becomes known when discovery
+finishes or a saved snapshot is loaded; until then it is null. Inventory entries
+can include excluded paths, and hard-linked file aliases share an entry.
+`pairs_total` counts all unordered candidate pairs whose entries have a vector or
+known SHA-256; `pairs_processed` includes profile/scope skips and hash-only checks,
+while `pairs_compared` counts actual vector comparisons. Group jobs expose
+`scores_total` with `scores_reused` for filtering saved similarity scores, then
+enter the separate grouping stage. These counters appear in events, durable
+status and terminal summaries; legacy immutable results can omit the new fields.
+Callers calculate percentages from a positive total and its matching numerator;
+null means unknown or inapplicable, and zero means no work. Percentage/ETA
+estimation and per-file inference fractions are not implemented. Checkpoint
+fields in the broader progress contract remain future work. Read-only queries
+and report exports currently emit one response without incremental progress.
 
 An invalid request produces a structured error before any job is accepted and
 returns exit code `2`. Error messages may change; the code remains the contract:

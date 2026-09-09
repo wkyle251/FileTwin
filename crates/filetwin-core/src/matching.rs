@@ -54,6 +54,37 @@ pub(crate) fn compare(work: &mut Work<'_>) -> Result<()> {
         work.job.counts.files_failed = failed;
         work.job.counts.locations=work.db.query_row("SELECT count(DISTINCT json_extract(payload,'$.location_id')) FROM records WHERE owner=?1 AND revision=1 AND kind='locations'",[&sid],|r|r.get(0))?;
     }
+    work.job.counts.files_processed = work.job.counts.files_discovered;
+    work.job.counts.files_total = Some(work.job.counts.files_discovered);
+    let candidates: u64 = work.db.query_row(
+        "SELECT count(*) FROM snapshot_files WHERE snapshot_id=?1 AND (vector_id IS NOT NULL OR digest IS NOT NULL)",
+        [&sid],
+        |r| r.get(0),
+    )?;
+    work.job.counts.pairs_total = Some(
+        u64::try_from(u128::from(candidates) * u128::from(candidates.saturating_sub(1)) / 2)
+            .map_err(|_| {
+                crate::Error::invalid("Candidate pair count exceeds the supported range")
+            })?,
+    );
+    // Older jobs have no candidate-work counter. Their durable cursor identifies
+    // exactly how many candidates precede the next pair, including skipped pairs.
+    if work.job.counts.pairs_processed == 0 && (work.job.next_a > 1 || work.job.next_b > 1) {
+        let (before_left, through_right): (u64, u64) = work.db.query_row(
+            "SELECT coalesce(sum(ordinal<?2),0),coalesce(sum(ordinal<=?3),0) FROM snapshot_files WHERE snapshot_id=?1 AND (vector_id IS NOT NULL OR digest IS NOT NULL)",
+            rusqlite::params![sid, work.job.next_a, work.job.next_b],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let previous_rows = u128::from(before_left)
+            * (2 * u128::from(candidates) - u128::from(before_left)).saturating_sub(1)
+            / 2;
+        let current_row = through_right.saturating_sub(before_left + 1);
+        work.job.counts.pairs_processed = u64::try_from(previous_rows + u128::from(current_row))
+            .map_err(|_| {
+                crate::Error::invalid("Candidate pair count exceeds the supported range")
+            })?;
+    }
+    work.checkpoint()?;
     loop {
         work.check()?;
         let Some(left) = items(&work.db, &sid, work.job.next_a - 1, 1)?
@@ -147,6 +178,7 @@ pub(crate) fn compare(work: &mut Work<'_>) -> Result<()> {
                     ));
                 }
             }
+            work.job.counts.pairs_processed += 1;
             work.job.next_a = left.ordinal;
             work.job.next_b = right.ordinal;
         }
@@ -194,11 +226,19 @@ pub(crate) fn filter_scores(work: &mut Work<'_>) -> Result<()> {
     let source_run = work.job.request.source_run_id.clone().expect("Score run");
     let run = work.job.run.clone().expect("Group run");
     work.job.counts.files_discovered = source.summary.counts.files_discovered;
+    work.job.counts.files_processed = source.summary.counts.files_discovered;
+    work.job.counts.files_total = Some(source.summary.counts.files_discovered);
     work.job.counts.files_ready = source.summary.counts.files_ready;
     work.job.counts.files_failed = source.summary.counts.files_failed;
     work.job.counts.files_excluded = source.summary.counts.files_excluded;
     work.job.counts.locations = source.summary.counts.locations;
+    work.job.counts.scores_total = Some(work.db.query_row(
+        "SELECT count(*) FROM records WHERE owner=?1 AND revision=?2 AND kind='scores'",
+        params![source_run, source.revision],
+        |r| r.get(0),
+    )?);
     work.job.stage = "filtering".into();
+    work.checkpoint()?;
     loop {
         work.check()?;
         let rows = {

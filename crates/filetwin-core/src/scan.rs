@@ -43,6 +43,8 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
     work.job.run = None;
     work.job.source_partial = false;
     work.job.counts.files_discovered = 0;
+    work.job.counts.files_processed = 0;
+    work.job.counts.files_total = None;
     work.job.counts.files_ready = 0;
     work.job.counts.files_failed = 0;
     work.job.counts.files_excluded = 0;
@@ -157,7 +159,8 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
         work.checkpoint()?;
     }
     refresh_counts(work)?;
-    Ok(())
+    work.job.counts.files_total = Some(work.job.counts.files_processed);
+    work.checkpoint()
 }
 
 fn excluded_entry(work: &mut Work<'_>, path: &Path, source: &str, reason: &str) -> Result<()> {
@@ -518,6 +521,7 @@ fn save_observation(
 fn refresh_counts(work: &mut Work<'_>) -> Result<()> {
     let counts=work.db.query_row("SELECT count(*),coalesce(sum(vector_id IS NOT NULL),0),coalesce(sum(json_extract(payload,'$.state')='excluded'),0),coalesce(sum(json_extract(payload,'$.state') IN ('failed','unsupported','insufficient_content','stale')),0) FROM job_files WHERE job_id=?1",[&work.job.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
     work.job.counts.files_discovered = counts.0;
+    work.job.counts.files_processed = counts.0;
     work.job.counts.files_ready = counts.1;
     work.job.counts.files_excluded = counts.2;
     work.job.counts.files_failed = counts.3;

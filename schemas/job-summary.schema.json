@@ -69,10 +69,27 @@
           "minimum": 0,
           "type": "integer"
         },
+        "files_processed": {
+          "default": 0,
+          "description": "Inventory entries with a recorded ready, failed or excluded outcome.\nHard-linked locations share an entry; excluded entries can be non-files.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "files_ready": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "files_total": {
+          "default": null,
+          "description": "Final inventory size; unknown while discovery is incomplete.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "groups": {
           "format": "uint64",
@@ -89,6 +106,23 @@
           "minimum": 0,
           "type": "integer"
         },
+        "pairs_processed": {
+          "default": 0,
+          "description": "Candidate pairs examined, including scope/profile skips and hash-only pairs.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pairs_total": {
+          "default": null,
+          "description": "All unordered candidate pairs in the frozen snapshot, not just vector comparisons.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "scores_retained": {
           "default": 0,
           "format": "uint64",
@@ -100,6 +134,16 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "scores_total": {
+          "default": null,
+          "description": "Saved similarity scores to inspect during a group job; excludes exact-pair records.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "similar_pairs": {
           "format": "uint64",

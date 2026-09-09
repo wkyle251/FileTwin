@@ -777,6 +777,13 @@ pub fn validate_request_shape(value: &Value) -> Result<()> {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Counts {
     pub files_discovered: u64,
+    /// Inventory entries with a recorded ready, failed or excluded outcome.
+    /// Hard-linked locations share an entry; excluded entries can be non-files.
+    #[serde(default)]
+    pub files_processed: u64,
+    /// Final inventory size; unknown while discovery is incomplete.
+    #[serde(default)]
+    pub files_total: Option<u64>,
     pub files_ready: u64,
     pub files_failed: u64,
     pub files_excluded: u64,
@@ -785,11 +792,20 @@ pub struct Counts {
     pub cache_hits: u64,
     pub bytes_read: u64,
     pub bytes_hashed: u64,
+    /// Candidate pairs examined, including scope/profile skips and hash-only pairs.
+    #[serde(default)]
+    pub pairs_processed: u64,
+    /// All unordered candidate pairs in the frozen snapshot, not just vector comparisons.
+    #[serde(default)]
+    pub pairs_total: Option<u64>,
     pub pairs_compared: u64,
     #[serde(default)]
     pub scores_retained: u64,
     #[serde(default)]
     pub scores_reused: u64,
+    /// Saved similarity scores to inspect during a group job; excludes exact-pair records.
+    #[serde(default)]
+    pub scores_total: Option<u64>,
     pub similar_pairs: u64,
     pub groups: u64,
     pub exact_pairs: u64,

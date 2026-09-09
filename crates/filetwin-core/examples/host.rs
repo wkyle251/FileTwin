@@ -11,7 +11,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = PathBuf::from(args.next().ok_or("Missing absolute source path")?);
     let engine = Engine::open(EngineConfig::new(&data), HostServices::default())?;
     let job = engine.submit(JobRequest::text_scan([source], 0.7))?;
-    // An event-driven host can consume job.events() and call job.cancel().
+    // An event-driven host can forward these counts to its UI and call job.cancel().
+    // Keep presentation in the host: the core never writes to standard streams.
+    for event in job.events() {
+        if let JobEvent::Progress { data, .. } = event {
+            eprintln!("progress: {data}");
+        }
+    }
     let summary = job.wait()?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     if let Some(run) = &summary.run_id {

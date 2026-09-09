@@ -3,6 +3,15 @@
 Date: 2026-09-09
 Status: milestone 1, all-family encoding, and saved-score/matrix implementation complete; qualification/maintenance remain planned
 
+## Caller progress counters
+
+- [x] Expose processed inventory counts and nullable totals through JSONL progress, status, summaries and the Rust API; leave percentage calculation to callers.
+- [x] Count all examined comparison candidates separately from actual vector comparisons, including scope/profile skips and hash-only checks; expose saved-score reuse totals for grouping.
+- [x] Preserve cancellation/resume counters, recover candidate progress from older cursors, and keep legacy published results readable.
+- [x] Document counter meanings, unknown/zero totals, streaming CLI input/output and Rust event handling in the README and architecture; regenerate the summary schema.
+- [x] Validate 50 workspace tests, including mixed file outcomes, cache hits, hard links, live native progress, skipped comparisons, exhausted budgets, and old/new resume checkpoints.
+- [x] Pass formatting, Clippy, release build and 11 schema checks; verify live JSONL and status for 240 generated files/28,680 candidates, saved-score reuse totals, and the runnable Rust host example.
+
 ## Saved scores, matrices, and later grouping
 
 - [x] Add explicit full-score retention with optional grouping and no mandatory cutoff in score-only mode; preserve the existing threshold workflow.

@@ -183,6 +183,12 @@ pub(crate) fn load_job(db: &Connection, id: &str) -> Result<Job> {
         })
         .optional()?
         .ok_or_else(|| Error::new(ErrorCode::NotFound, "status", "Unknown job ID"))?;
+    let count_values: Value = serde_json::from_str(&row.7)?;
+    let legacy_files = count_values.get("files_processed").is_none();
+    let mut counts: Counts = serde_json::from_value(count_values)?;
+    if legacy_files {
+        counts.files_processed = counts.files_discovered;
+    }
     Ok(Job {
         id: id.into(),
         request: serde_json::from_str(&row.0)?,
@@ -192,7 +198,7 @@ pub(crate) fn load_job(db: &Connection, id: &str) -> Result<Job> {
         started_at: row.4,
         elapsed: row.5,
         used: row.6,
-        counts: serde_json::from_str(&row.7)?,
+        counts,
         snapshot: row.8,
         run: row.9,
         next_a: row.10,
