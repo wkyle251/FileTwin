@@ -31,6 +31,11 @@ impl Encoder {
                 "Model and temporary directories must be absolute",
             ));
         }
+        if !config.temp_dir.is_dir() {
+            return Err(Error::invalid(
+                "Temporary base directory must already exist",
+            ));
+        }
         if !(1..=64).contains(&config.workers)
             || !(1..=64).contains(&config.runtime.inference_threads)
             || config.runtime.cuda_device_id < 0
@@ -93,79 +98,98 @@ impl Encoder {
         }
         // No persistent per-run state: source copies and CoreML compilation
         // artifacts belong to this private directory and are removed on exit.
-        std::fs::create_dir_all(&self.config.temp_dir)?;
+        let started = Instant::now();
         let temporary = tempfile::Builder::new()
             .prefix("filetwin-")
             .tempdir_in(&self.config.temp_dir)?;
-        let mut config = self.config.clone();
-        config.temp_dir = std::fs::canonicalize(temporary.path())?;
-        excluded.push(config.temp_dir.clone());
-        if config.model_dir.exists() {
-            excluded.push(std::fs::canonicalize(&config.model_dir)?);
-        }
-        if excluded.contains(&root) {
-            return Err(Error::invalid(
-                "Input directory cannot be a model, vector-output or staging artifact",
-            ));
-        }
-        let profiles = profile::experimental_profiles_for(config.backend)
-            .into_iter()
-            .map(|p| (p.family, p.profile_id))
-            .collect();
-        let pool = native::Pool::new(&config);
-        let workers = pool.capacity();
-        let mut run = Run {
-            config,
-            root: root.clone(),
-            excluded,
-            cache,
-            profiles,
-            counts: Counts::default(),
-            records: Vec::new(),
-            pending: (0..workers).map(|_| None).collect(),
-            pool,
-            cancel,
-            progress: &mut progress,
-            started: Instant::now(),
-            last_progress: Instant::now(),
-            stage: Stage::Discovering,
-            discovery_complete: true,
-        };
-        run.emit(true);
-        let result = run.process();
-        let cancelled = match result {
-            Err(e) if e.code == ErrorCode::Cancelled => true,
-            Err(e) => return Err(e),
-            Ok(()) => false,
-        };
-        // Destroy native children before releasing the private staged sources.
-        drop(run.pool);
-        run.records
-            .sort_by_key(|r| r.path.to_path_buf().expect("Generated path"));
-        let summary = Summary {
-            counts: run.counts.clone(),
-            elapsed_seconds: run.started.elapsed().as_secs_f64(),
-            backend: self.config.backend,
-            workers,
-            cancelled,
-        };
-        (run.progress)(&Progress {
-            stage: if cancelled {
+        let result = (|| -> Result<VectorFile> {
+            let mut config = self.config.clone();
+            config.temp_dir = std::fs::canonicalize(temporary.path())?;
+            excluded.push(config.temp_dir.clone());
+            if config.model_dir.exists() {
+                excluded.push(std::fs::canonicalize(&config.model_dir)?);
+            }
+            if excluded.contains(&root) {
+                return Err(Error::invalid(
+                    "Input directory cannot be a model, vector-output or staging artifact",
+                ));
+            }
+            let profiles = profile::experimental_profiles_for(config.backend)
+                .into_iter()
+                .map(|p| (p.family, p.profile_id))
+                .collect();
+            let pool = native::Pool::new(&config);
+            let workers = pool.capacity();
+            let mut run = Run {
+                config,
+                root: root.clone(),
+                excluded,
+                cache,
+                profiles,
+                counts: Counts::default(),
+                records: Vec::new(),
+                pending: (0..workers).map(|_| None).collect(),
+                pool,
+                cancel,
+                progress: &mut progress,
+                started,
+                last_progress: Instant::now(),
+                stage: Stage::Discovering,
+                discovery_complete: true,
+            };
+            run.emit(true);
+            let result = run.process();
+            let cancelled = match result {
+                Err(e) if e.code == ErrorCode::Cancelled => true,
+                Err(e) => return Err(e),
+                Ok(()) => false,
+            };
+            // Destroy native children before releasing the private staged sources.
+            drop(run.pool);
+            run.records
+                .sort_by_key(|r| r.path.to_path_buf().expect("Generated path"));
+            let summary = Summary {
+                counts: run.counts.clone(),
+                elapsed_seconds: run.started.elapsed().as_secs_f64(),
+                backend: self.config.backend,
+                workers,
+                cancelled,
+            };
+            Ok(VectorFile {
+                format: VECTOR_FILE_FORMAT.into(),
+                schema_version: SCHEMA_VERSION,
+                directory: FilePath::from_path(&root),
+                complete: !cancelled && run.discovery_complete,
+                files: run.records,
+                summary,
+            })
+        })();
+        // Drop all workers/files before removing the invocation directory. Check
+        // deletion explicitly: TempDir's Drop would silently ignore failures.
+        temporary.close().map_err(|e| {
+            let mut error = Error::new(
+                ErrorCode::IoError,
+                "cleanup",
+                format!("Cannot remove temporary processing data: {e}"),
+            );
+            if let Err(cause) = &result {
+                error.details["operation_error"] =
+                    serde_json::to_value(cause).expect("Serializable error");
+            }
+            error
+        })?;
+        let mut result = result?;
+        result.summary.elapsed_seconds = started.elapsed().as_secs_f64();
+        progress(&Progress {
+            stage: if result.summary.cancelled {
                 Stage::Cancelled
             } else {
                 Stage::Completed
             },
-            counts: summary.counts.clone(),
-            elapsed_seconds: summary.elapsed_seconds,
+            counts: result.summary.counts.clone(),
+            elapsed_seconds: result.summary.elapsed_seconds,
         });
-        Ok(VectorFile {
-            format: VECTOR_FILE_FORMAT.into(),
-            schema_version: SCHEMA_VERSION,
-            directory: FilePath::from_path(&root),
-            complete: !cancelled && run.discovery_complete,
-            files: run.records,
-            summary,
-        })
+        Ok(result)
     }
 }
 

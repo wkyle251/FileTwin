@@ -63,18 +63,34 @@ def main():
         tmp = Path(tmp)
         source = tmp / "input"
         source.mkdir()
+        scratch = tmp / "scratch"
+        scratch.mkdir()
         saved = tmp / "vectors.json"
         environment = {k: v for k, v in os.environ.items() if not k.startswith("FILETWIN_")}
         environment["FILETWIN_FFMPEG"] = str(Path(args.ffmpeg).resolve())
+        environment["TMPDIR"] = str(scratch.resolve())
+        def inventory(directory):
+            return {str(p.relative_to(directory)): ("directory",) if p.is_dir() else ("file", p.stat().st_size, p.stat().st_mtime_ns)
+                    for p in directory.rglob("*")}
+        original_assets = inventory(model_dir)
         def ffmpeg(*cmd):
             subprocess.run([args.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *map(str, cmd)], check=True, timeout=60)
         def cli(*cmd, expected=0):
+            before = inventory(tmp)
             p = subprocess.run([str(binary), *map(str, cmd), "--model-dir", str(model_dir), "--backend", args.backend],
-                               capture_output=True, text=True, env=environment, timeout=300)
+                               cwd=tmp, capture_output=True, text=True, env=environment, timeout=300)
             result = json.loads(p.stdout)
             assert p.returncode == expected, (p.returncode, p.stderr, result["summary"], [f for f in result["files"] if f["state"] != "ready"])
             progress = [json.loads(line) for line in p.stderr.splitlines()]
             assert progress[-1]["data"]["counts"] == result["summary"]["counts"]
+            after = inventory(tmp)
+            for index, value in enumerate(cmd[:-1]):
+                if value in ("--output", "-o"):
+                    output = str(Path(cmd[index+1]).relative_to(tmp))
+                    before.pop(output, None); after.pop(output, None)
+            assert after == before, "Encoding left extra data or modified an input"
+            assert not list(scratch.iterdir()), "Temporary processing files remain"
+            assert inventory(model_dir) == original_assets, "Encoding modified native assets"
             return result
         text = "FileTwin checks document text across formats."
         (source / "document.txt").write_text(text + "\n")
@@ -216,7 +232,7 @@ def main():
         finally:
             if host.poll() is None:
                 host.kill(); host.communicate(timeout=5)
-        report["checks"] = ["all families", "document extraction", "image formats and EXIF", "audio codec/rate changes and hard negatives including unrelated noise", "video transcode and timeline coverage", "profile compatibility", "verified portable cache", "audio-only MP4 detection", "rename reuse", "unchanged source bytes", "corrupt and blank inputs", "single-frame video", "shifted video stream timestamps", "native orphan cleanup after host SIGKILL"]
+        report["checks"] = ["all families", "document extraction", "image formats and EXIF", "audio codec/rate changes and hard negatives including unrelated noise", "video transcode and timeline coverage", "profile compatibility", "verified portable cache", "audio-only MP4 detection", "rename reuse", "unchanged source bytes", "no retained scratch/cache data", "only explicit output saved", "unchanged native asset directory", "corrupt and blank inputs", "single-frame video", "shifted video stream timestamps", "native orphan cleanup after host SIGKILL"]
     print(json.dumps(report, indent=2))
     if args.report:
         args.report.write_text(json.dumps(report, indent=2) + "\n")

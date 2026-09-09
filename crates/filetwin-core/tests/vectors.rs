@@ -18,6 +18,7 @@ impl Fixture {
         let root = temp.path().canonicalize().unwrap();
         let source = root.join("input");
         fs::create_dir(&source).unwrap();
+        fs::create_dir(root.join("staging")).unwrap();
         let encoder = Encoder::new(EncoderConfig::new(
             root.join("models"),
             root.join("staging"),
@@ -343,7 +344,12 @@ fn progress_reports_counts_and_separate_discovery_and_encoding() {
         .encode(
             &EncodeRequest::new(&f.source),
             &CancellationToken::default(),
-            |p| progress.push(p.clone()),
+            |p| {
+                if p.stage == Stage::Completed {
+                    assert_eq!(fs::read_dir(f.root.join("staging")).unwrap().count(), 0);
+                }
+                progress.push(p.clone());
+            },
         )
         .unwrap();
     assert_eq!(progress[0].stage, Stage::Discovering);
@@ -359,9 +365,75 @@ fn progress_reports_counts_and_separate_discovery_and_encoding() {
 }
 
 #[test]
+fn missing_temporary_parents_are_not_created() {
+    let f = Fixture::new();
+    let parent = f.root.join("missing/parent");
+    let config = EncoderConfig::new(f.root.join("models"), &parent);
+    assert!(matches!(Encoder::new(config), Err(e) if e.code == ErrorCode::InvalidRequest));
+    assert!(!f.root.join("missing").exists());
+}
+
+#[test]
+fn fatal_discovery_errors_also_clean_processing_data() {
+    let f = Fixture::new();
+    let result = f.encoder.encode(
+        &EncodeRequest::new(&f.source),
+        &CancellationToken::default(),
+        |p| {
+            if p.stage == Stage::Discovering {
+                fs::remove_dir(&f.source).unwrap();
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(fs::read_dir(f.root.join("staging")).unwrap().count(), 0);
+}
+
+#[test]
+fn cleanup_failures_are_reported_instead_of_silently_returning_success() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root bypasses permissions, so it cannot exercise this failure mode.
+    // SAFETY: geteuid only reads the current process's effective user ID.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let f = Fixture::new();
+    fs::write(f.source.join("a.txt"), "complete source text").unwrap();
+    let mut blocked = None;
+    let error = f
+        .encoder
+        .encode(
+            &EncodeRequest::new(&f.source),
+            &CancellationToken::default(),
+            |p| {
+                if p.stage == Stage::Encoding && blocked.is_none() {
+                    let run = fs::read_dir(f.root.join("staging"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    let path = run.join("blocked");
+                    fs::create_dir(&path).unwrap();
+                    fs::write(path.join("cache"), "temporary data").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+                    blocked = Some(path);
+                }
+                assert_ne!(p.stage, Stage::Completed);
+            },
+        )
+        .unwrap_err();
+    let blocked = blocked.unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(blocked.parent().unwrap()).unwrap();
+    assert_eq!(error.code, ErrorCode::IoError);
+    assert_eq!(error.stage, "cleanup");
+}
+
+#[test]
 fn encoder_configuration_is_validated_before_processing() {
     let f = Fixture::new();
-    let mut config = EncoderConfig::new(f.root.join("models"), f.root.join("tmp"));
+    let mut config = EncoderConfig::new(f.root.join("models"), f.root.join("staging"));
     config.workers = 0;
     assert!(Encoder::new(config.clone()).is_err());
     config.workers = 2;

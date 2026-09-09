@@ -12,6 +12,9 @@ The CLI accepts `filetwin DIRECTORY [VECTORS_FILE]` and four operational options
 `VectorFile` JSON value; stderr is JSONL progress/errors. No thresholds, profile
 opt-ins, stdin request language, configuration file, run ID, or query command is
 needed. Help/version remain standard CLI output.
+Results are returned without persistent processing data by default. Only an
+explicit `--output FILE` saves a result; supplying a previous vector file alone
+does not change it. No database, log, history or persistent encoding cache is created.
 
 The Rust API exposes immutable `Encoder` configuration, `EncodeRequest`, a
 shared `CancellationToken`, callback `Progress`, and returned `VectorFile`.
@@ -87,7 +90,8 @@ when a semantic vector is unavailable; raw-byte hashing is not semantic encoding
 
 ## Encoding lifecycle
 
-1. Validate configuration and directory. Resolve caller paths, reject symlink
+1. Validate configuration and directory. The temporary base must already exist;
+   encoding never creates missing parent directories. Resolve caller paths, reject symlink
    roots, and securely open originals with no-follow component traversal.
 2. Parse and validate an optional previous vector file. Preflight a requested
    output path. Exclude these artifact paths and model/private staging directories.
@@ -106,13 +110,14 @@ when a semantic vector is unavailable; raw-byte hashing is not semantic encoding
    norm. Verify the original descriptor/path still describe the observed revision.
    Publish the vector only when these checks pass. Otherwise publish an error;
    invalidate the ID too if the source changed.
-8. Stop/drop all workers, sort completed records by relative path, return the
-   vector file and final counters, then release private temporary resources.
+8. Stop/drop all workers, sort completed records by relative path, and explicitly
+   remove the invocation's private temporary directory. Check cleanup errors before
+   emitting final completed/cancelled counters and returning the vector file.
    The CLI optionally saves the result atomically before writing stdout.
 
 All current originals are hashed even when a matching vector already exists.
 There is no path/mtime shortcut. Native staging may occur before the cache hit
-is known; the temporary copy is discarded when reuse succeeds. Persistent models
+is known; the temporary copy is discarded when reuse succeeds. Model sessions
 and worker processes are reused within one invocation, never retained by a
 background service between invocations.
 
@@ -154,7 +159,8 @@ Saving validates the result and target, writes a private temporary file next to
 the destination, flushes/syncs it and atomically renames it. Existing destinations
 must be valid FileTwin vector files and are checked for changes before replacement.
 New destinations use no-clobber creation; symlink/unrelated targets are refused.
-Only the explicit output is replaced. Saving does not append to source metadata.
+Only the explicit output is replaced. Saving keeps no history or backup files and
+does not append to source metadata. Its size reflects the current returned records.
 Do not have concurrent hosts write the same destination; unique outputs are the
 simple caller policy. Old cache entries for deleted paths are absent from the new
 result; no separate pruning or database cleanup operation exists.
@@ -176,7 +182,9 @@ The result can be saved and reused. Processing has no resume token or checkpoint
 
 The CLI handles SIGINT/SIGTERM through the shared cancellation token. Rust hosts
 call `cancel()` themselves. Worker/process groups are killed and staged files
-removed on normal return, error or cancellation. Fatal input/output errors may
+removed on normal return, error or cancellation. Failure to remove temporary
+processing data returns an I/O error at stage `cleanup`, with no successful terminal
+event or saved result. Fatal input/output errors may
 prevent a result. SIGKILL/power loss cannot return partial JSON or guarantee temp
 directory cleanup; real workers monitor parent death and terminate descendants.
 There is no crash-staging garbage collector.
@@ -205,8 +213,11 @@ they get an explicit resource error. Reader allocations have further bounds.
 These allowances do not cap whole-program RSS or all GPU memory. Linux CPU workers
 use RLIMIT_AS. GPU driver address-space reservation prevents the same limit for
 CUDA, whose provider has an arena allowance. CoreML compilation caches are private
-to the invocation and removed on return. Pinned native assets are provisioned
-explicitly; ordinary encoding has no network/model download step.
+to the invocation. Workers receive temporary/cache environment paths inside their
+owned session directory, including `CUDA_CACHE_PATH` for CUDA JIT artifacts; these
+are removed on return. No cache survives for reuse across invocations. Pinned native
+assets are provisioned explicitly and only read during encoding; ordinary encoding
+has no network/model download step and does not grow the installation/model directory.
 
 ## Platform and deployment scope
 

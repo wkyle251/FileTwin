@@ -48,6 +48,7 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub model_dir: PathBuf,
+    /// Existing parent for disposable processing data; never created by encode.
     pub temp_dir: PathBuf,
     pub runtime: RuntimeConfig,
     pub backend: Backend,

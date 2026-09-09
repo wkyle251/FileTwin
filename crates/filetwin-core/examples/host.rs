@@ -2,7 +2,6 @@
 use filetwin_core::{
     Encoder,
     api::{CancellationToken, EncodeRequest, EncoderConfig},
-    write_vectors,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -11,7 +10,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let mut request = EncodeRequest::new(directory);
     request.vectors_file = args.next().map(std::fs::canonicalize).transpose()?;
-    request.output_file = Some(cwd.join("vectors.json"));
     let mut config = EncoderConfig::new(cwd.join(".filetwin/models"), std::env::temp_dir());
     config.runtime.worker_path = Some(cwd.join("target/release/filetwin-worker"));
     let suffix = if cfg!(target_os = "macos") {
@@ -44,7 +42,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             progress.counts.cache_hits
         );
     })?;
-    write_vectors(request.output_file.as_deref().unwrap(), &result)?;
     for file in &result.files {
         println!(
             "{:?}: {:?}, {} vector components",

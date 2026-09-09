@@ -27,6 +27,7 @@ impl Fixture {
         let input = root.join("input");
         fs::create_dir(&input).unwrap();
         let mut config = EncoderConfig::new(root.join("models"), root.join("staging"));
+        fs::create_dir(&config.temp_dir).unwrap();
         fs::create_dir(&config.model_dir).unwrap();
         fs::write(config.model_dir.join(profile::SSCD_MODEL_FILE), []).unwrap();
         let worker = root.join("worker");
@@ -94,6 +95,35 @@ fn serve(root: &Path) -> String {
         "while IFS= read -r request; do /bin/cat '{}'; printf '\\n'; done",
         root.join("response.json").display()
     )
+}
+
+#[test]
+fn native_cache_and_scratch_files_are_disposable_between_calls() {
+    let f = Fixture::new(|root| {
+        format!(
+            r#"
+while IFS= read -r request; do
+    case "$TMPDIR" in '{root}/staging/'*) ;; *) exit 31 ;; esac
+    case "$XDG_CACHE_HOME" in "$TMPDIR/"*) ;; *) exit 32 ;; esac
+    case "$CUDA_CACHE_PATH" in "$TMPDIR/"*) ;; *) exit 33 ;; esac
+    [ "$TMP" = "$TMPDIR" ] && [ "$TEMP" = "$TMPDIR" ] || exit 34
+    printf 'scratch' > "$TMPDIR/decoder-tmp"
+    printf 'cache' > "$XDG_CACHE_HOME/library-cache"
+    printf 'compiled' > "$CUDA_CACHE_PATH/kernel-cache"
+    /bin/cat '{root}/response.json'
+    printf '\n'
+done
+"#,
+            root = root.display()
+        )
+    });
+    f.images(3);
+    for _ in 0..3 {
+        let result = f.run();
+        assert_eq!(result.summary.counts.files_ready, 3);
+        assert_eq!(result.summary.counts.vectors_encoded, 3);
+        f.clean();
+    }
 }
 fn wait_for(path: &Path) {
     let start = Instant::now();

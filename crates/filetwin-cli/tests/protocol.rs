@@ -5,14 +5,88 @@ use std::{
     process::{Command, Output},
 };
 
-fn cli(root: &Path, args: &[&str]) -> Output {
+fn command(root: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_filetwin"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("FILETWIN_") {
             command.env_remove(key);
         }
     }
-    command.current_dir(root).args(args).output().unwrap()
+    command.current_dir(root);
+    command
+}
+fn cli(root: &Path, args: &[&str]) -> Output {
+    command(root).args(args).output().unwrap()
+}
+
+fn tree(
+    root: &Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Option<(Vec<u8>, std::time::SystemTime)>> {
+    let mut result = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = path.symlink_metadata().unwrap();
+            let value = if metadata.is_dir() {
+                pending.push(path.clone());
+                None
+            } else {
+                Some((fs::read(&path).unwrap(), metadata.modified().unwrap()))
+            };
+            result.insert(path.strip_prefix(root).unwrap().to_owned(), value);
+        }
+    }
+    result
+}
+
+#[test]
+fn repeated_runs_only_persist_the_explicit_output_file() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path();
+    fs::create_dir(root.join("input")).unwrap();
+    fs::create_dir(root.join("scratch")).unwrap();
+    fs::write(root.join("input/a.txt"), "a complete document").unwrap();
+    let before = tree(root);
+    let run = |args: &[&str], code| {
+        result(
+            &command(root)
+                .env("TMPDIR", root.join("scratch"))
+                .args(args)
+                .output()
+                .unwrap(),
+            code,
+        )
+    };
+    for _ in 0..3 {
+        assert_eq!(run(&["input"], 0)["summary"]["counts"]["files_ready"], 1);
+        assert_eq!(tree(root), before);
+    }
+    let first = run(&["input", "--output", "vectors.json"], 0);
+    let saved = fs::read(root.join("vectors.json")).unwrap();
+    assert_eq!(first, serde_json::from_slice::<Value>(&saved).unwrap());
+    let with_output = tree(root);
+    let mut others = with_output.clone();
+    others.remove(Path::new("vectors.json"));
+    assert_eq!(others, before);
+    for _ in 0..3 {
+        assert_eq!(
+            run(&["input", "vectors.json"], 0)["summary"]["counts"]["cache_hits"],
+            1
+        );
+        assert_eq!(tree(root), with_output); // Reuse input is read-only.
+    }
+    for _ in 0..2 {
+        let reused = run(&["input", "vectors.json", "-o", "vectors.json"], 0);
+        assert_eq!(reused["files"].as_array().unwrap().len(), 1);
+        let mut after = tree(root);
+        after.remove(Path::new("vectors.json"));
+        assert_eq!(after, before); // No backups, history or extra caches.
+    }
+    fs::write(root.join("input/broken.png"), b"\x89PNG\r\n\x1a\ninvalid").unwrap();
+    let before_failure = tree(root);
+    assert_eq!(run(&["input"], 3)["summary"]["counts"]["files_failed"], 1);
+    assert_eq!(tree(root), before_failure);
 }
 fn result(output: &Output, code: i32) -> Value {
     assert_eq!(
@@ -124,7 +198,7 @@ fn backend_selection_does_not_require_a_gpu_for_text() {
 }
 
 #[test]
-fn signals_return_and_save_a_partial_vector_file() {
+fn signals_return_partial_results_and_save_only_when_requested() {
     use std::{
         os::unix::fs::PermissionsExt,
         process::Stdio,
@@ -135,6 +209,7 @@ fn signals_return_and_save_a_partial_vector_file() {
         let root = t.path().canonicalize().unwrap();
         let input = root.join("input");
         fs::create_dir(&input).unwrap();
+        fs::create_dir(root.join("scratch")).unwrap();
         fs::write(input.join("image.png"), b"\x89PNG\r\n\x1a\n").unwrap();
         let models = root.join("models");
         fs::create_dir_all(models.join("runtime")).unwrap();
@@ -163,13 +238,16 @@ fn signals_return_and_save_a_partial_vector_file() {
                 command.env_remove(key);
             }
         }
-        let mut child = command
+        command
             .arg(&input)
-            .arg("--output")
-            .arg(&output)
             .arg("--model-dir")
             .arg(&models)
             .env("FILETWIN_WORKER", &worker)
+            .env("TMPDIR", root.join("scratch"));
+        if signal == libc::SIGTERM {
+            command.arg("--output").arg(&output);
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -189,9 +267,14 @@ fn signals_return_and_save_a_partial_vector_file() {
         assert_eq!(response["complete"], false);
         assert_eq!(response["summary"]["cancelled"], true);
         assert_eq!(response["summary"]["counts"]["files_processed"], 0);
-        assert_eq!(
-            response,
-            serde_json::from_slice::<Value>(&fs::read(output).unwrap()).unwrap()
-        );
+        if signal == libc::SIGTERM {
+            assert_eq!(
+                response,
+                serde_json::from_slice::<Value>(&fs::read(output).unwrap()).unwrap()
+            );
+        } else {
+            assert!(!output.exists());
+        }
+        assert_eq!(fs::read_dir(root.join("scratch")).unwrap().count(), 0);
     }
 }

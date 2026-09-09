@@ -243,6 +243,9 @@ impl Process {
         let directory = tempfile::Builder::new()
             .prefix("filetwin-session-")
             .tempdir_in(&config.temp_dir)?;
+        let cache = directory.path().join("cache");
+        let cuda_cache = cache.join("cuda");
+        std::fs::create_dir_all(&cuda_cache)?;
         let mut command = Command::new(
             config
                 .runtime
@@ -255,6 +258,14 @@ impl Process {
             .env_clear()
             .env("LC_ALL", "C")
             .env("OMP_NUM_THREADS", "1")
+            // Keep decoder/library scratch files and generated caches inside
+            // the invocation. Never use the caller's persistent cache paths.
+            .env("TMPDIR", directory.path())
+            .env("TMP", directory.path())
+            .env("TEMP", directory.path())
+            .env("XDG_CACHE_HOME", &cache)
+            // CUDA otherwise defaults to the user's ~/.nv/ComputeCache.
+            .env("CUDA_CACHE_PATH", &cuda_cache)
             .current_dir(directory.path())
             .process_group(0)
             .stdin(Stdio::piped())

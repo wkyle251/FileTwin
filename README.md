@@ -4,6 +4,7 @@ FileTwin encodes a local directory and returns **each file's content ID and vect
 Use its Rust CLI from any application, or embed the `filetwin-core` Rust library.
 An optional JSON vector file reuses previous encodings. There is no database,
 threshold configuration, automatic grouping, or file-metadata modification.
+**Nothing is saved by default.** Saving a result requires `--output FILE`.
 
 This is the **0.2 developer preview**, with a simplified interface that replaces
 the 0.1 scan/index/compare workflow. Encoding profiles still need accuracy
@@ -35,6 +36,27 @@ filetwin ./files vectors.json --output vectors.json
 Use `./target/release/filetwin` in place of `filetwin` until the binaries are on
 PATH. Install `filetwin-worker` beside the CLI for native formats. Native models
 and libraries require the one-time setup below; processing never downloads them.
+
+## Disk usage
+
+Normal runs return results on stdout and progress on stderr. They create no
+database, saved vectors, log files, or history. A supplied `VECTORS_FILE` is only
+read; it is not updated automatically. `--output FILE` explicitly saves one result
+in addition to stdout. Reusing that output path replaces the previous result;
+it does not append history or keep backups. Its size depends on the current result.
+
+Processing can use disk temporarily for private source copies, decoder scratch
+files, and CoreML/CUDA caches. FileTwin removes its temporary processing directory
+on completion, handled errors, and SIGINT/SIGTERM cancellation. Cleanup finishes
+before a result is returned.
+Cleanup failures are reported as errors, not successful completion. A forced kill
+(`SIGKILL`) or power loss can leave temporary files; no process can finish its
+cleanup after it has been killed.
+
+Repeated normal runs do not grow the FileTwin installation or model directory.
+Provisioned models stay in place and are only read during processing. Building
+with Cargo, explicitly provisioning models, saving with `--output`, or redirecting
+stdout/stderr to files uses disk space by choice.
 
 ## Input and parameters
 
@@ -182,20 +204,18 @@ completed progress event followed by that fatal error.
 ### Rust library
 
 ```rust
-use filetwin_core::{Encoder, api::*, write_vectors};
+use filetwin_core::{Encoder, api::*};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let config = EncoderConfig::new(cwd.join(".filetwin/models"), std::env::temp_dir());
     let encoder = Encoder::new(config)?;
-    let mut request = EncodeRequest::new(cwd.join("examples/text"));
-    request.output_file = Some(cwd.join("vectors.json"));
-    // Set request.vectors_file = Some(cwd.join("vectors.json")) to reuse a prior file.
+    let request = EncodeRequest::new(cwd.join("examples/text"));
     let result = encoder.encode(&request, &CancellationToken::default(), |p| {
         eprintln!("{} files processed", p.counts.files_processed);
     })?;
-    write_vectors(request.output_file.as_deref().unwrap(), &result)?;
     // result.files contains file_id, profile_id, vector and per-file outcomes.
+    println!("{} files returned", result.files.len());
     Ok(())
 }
 ```
@@ -203,7 +223,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The library requires absolute paths and explicit native paths in
 `EncoderConfig.runtime`; it does not search PATH, install signal handlers, or
 write to stdout/stderr. `encode` blocks; a host can put it on its own thread and
-share a cloned `CancellationToken`. Each invocation owns its temporary resources.
+share a cloned `CancellationToken`. `EncoderConfig.temp_dir` must name an existing
+directory, such as `std::env::temp_dir()`; FileTwin creates and cleans only its own
+private child directory. Terminal progress is emitted after that cleanup succeeds.
+
+For reuse, set `request.vectors_file` before encoding. To save explicitly, set
+`request.output_file` before encoding so discovery excludes the destination, then
+call `filetwin_core::write_vectors(path, &result)` afterwards. `encode` itself
+only returns data, even when `output_file` is set.
 See the runnable [host example](crates/filetwin-core/examples/host.rs).
 
 ### Similarity belongs to the caller
@@ -255,10 +282,10 @@ errors; it does not relabel CPU inference as GPU inference. An initialized provi
 may execute unsupported graph operators on CPU. NVIDIA hardware performance and
 numerical qualification remain pending; CPU and CoreML are exercised locally.
 
-Native processes and model sessions are reused within each invocation. CoreML
-compilation artifacts live in its private temporary directory and are removed on
-return. Default shared native admission is 2 GiB memory and 10 GiB staging; these
-are not hard whole-process/GPU memory limits. Rust hosts may adjust them.
+Native processes and model sessions are reused within each invocation. Generated
+CoreML compilation and CUDA JIT caches live in private temporary storage and are
+removed on return. Default shared native admission is 2 GiB memory and 10 GiB
+staging; these are not hard whole-process/GPU memory limits. Rust hosts may adjust them.
 
 Advanced deployment settings use environment variables, keeping the CLI small:
 

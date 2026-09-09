@@ -82,6 +82,14 @@ and result assembly remain on the coordinator. There is no database. SIGKILL or
 power loss may leave temporary directories; crash-staging garbage collection and
 process reuse across invocations are not implemented.
 
+The temporary base directory must already exist. The coordinator creates only
+its own private child, stops all workers, then explicitly removes that child before
+returning data or emitting terminal progress. Cleanup failure is an I/O error at
+stage `cleanup`, rather than a successful result with silently retained files.
+Worker `TMPDIR`, `TMP`, `TEMP`, `XDG_CACHE_HOME` and `CUDA_CACHE_PATH` all point
+inside their disposable session directory. Decoder scratch and library caches
+therefore share its lifetime; the host's environment remains unchanged.
+
 The sum of active native staging must fit `staging_bytes`, reserving an additional
 2 MiB for each pending file. File growth is checked against the remaining allowance.
 The default is 10 GiB and can be raised for larger files. Buffers and image
@@ -134,9 +142,13 @@ unsupported graph nodes on CPU. Per-file extraction records include backend,
 thread count, model reuse and loading/inference/worker timings.
 
 CoreML compilation is serialized across workers and cached in the invocation's
-private temporary directory, keyed by runtime version and model SHA-256. It is
-removed on normal return, error or cancellation; its size is outside source-copy
-staging allowances. CUDA library search directories are explicit host settings;
+private temporary directory, keyed by runtime version and model SHA-256. CUDA
+JIT disk caching uses the disposable worker directory through
+[`CUDA_CACHE_PATH`](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html).
+These generated caches can be reused within a call and are removed on normal
+return, error or cancellation; their size is outside source-copy staging allowances.
+Provisioned model/runtime assets are only read, never updated by encoding.
+CUDA library search directories are explicit host settings;
 worker environments do not inherit `LD_LIBRARY_PATH`. FFmpeg and ffprobe remain
 version 9 and their full version strings are recorded in file provenance.
 

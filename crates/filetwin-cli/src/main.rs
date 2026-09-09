@@ -16,7 +16,7 @@ use std::{
     name = "filetwin",
     version,
     about = "Encode a directory and return file IDs with vectors",
-    after_help = "JSON vectors go to stdout; progress counters go to stderr as JSONL.\nThe optional VECTORS_FILE reuses vectors after verifying current file contents.\nNo database, thresholds or experimental flags are required."
+    after_help = "JSON vectors go to stdout; progress counters go to stderr as JSONL.\nNothing is saved unless --output FILE is provided.\nThe optional VECTORS_FILE reuses vectors after verifying current file contents.\nNo database, thresholds or experimental flags are required."
 )]
 struct Args {
     /// Directory to read recursively, including hidden files.
