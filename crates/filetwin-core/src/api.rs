@@ -22,7 +22,7 @@ pub struct EngineConfig {
 
 /// Explicit paths for native decoding. The library never searches PATH, reads
 /// environment configuration, downloads models, or installs signal handlers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub worker_path: Option<PathBuf>,
@@ -30,6 +30,26 @@ pub struct RuntimeConfig {
     pub ffprobe_path: Option<PathBuf>,
     pub onnxruntime_path: Option<PathBuf>,
     pub pdfium_path: Option<PathBuf>,
+    /// CPU threads per native inference process; reference profiles always use one.
+    pub inference_threads: u32,
+    pub cuda_device_id: i32,
+    /// Explicit CUDA/cuDNN search directories; never read from the host environment.
+    pub cuda_library_dirs: Vec<PathBuf>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_path: None,
+            ffmpeg_path: None,
+            ffprobe_path: None,
+            onnxruntime_path: None,
+            pdfium_path: None,
+            inference_threads: 2,
+            cuda_device_id: 0,
+            cuda_library_dirs: Vec::new(),
+        }
+    }
 }
 
 impl EngineConfig {
@@ -371,7 +391,15 @@ impl JobRequest {
     /// Opt into the current experimental profile for each of the four families.
     /// The caller chooses the cutoff; this is not a calibrated default.
     pub fn experimental_scan(paths: impl IntoIterator<Item = PathBuf>, threshold: f64) -> Self {
-        let profiles = profile::experimental_profiles();
+        Self::experimental_scan_with_backend(paths, threshold, profile::Backend::Cpu)
+    }
+
+    pub fn experimental_scan_with_backend(
+        paths: impl IntoIterator<Item = PathBuf>,
+        threshold: f64,
+        backend: profile::Backend,
+    ) -> Self {
+        let profiles = profile::experimental_profiles_for(backend);
         Self {
             sources: Some(paths.into_iter().map(Source::local).collect()),
             profiles: Some(
@@ -401,6 +429,15 @@ impl JobRequest {
     pub fn experimental_scores(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         let mut request = Self::experimental_index(paths);
         request.operation = Operation::Scan;
+        request.matching = Some(Matching::all_scores());
+        request
+    }
+
+    pub fn experimental_scores_with_backend(
+        paths: impl IntoIterator<Item = PathBuf>,
+        backend: profile::Backend,
+    ) -> Self {
+        let mut request = Self::experimental_scan_with_backend(paths, 0.0, backend);
         request.matching = Some(Matching::all_scores());
         request
     }
@@ -610,7 +647,7 @@ impl JobRequest {
         if !self.operation.uses_saved_input() {
             limits.staging_bytes.get_or_insert(10 * 1024 * 1024 * 1024);
             limits.io_workers.get_or_insert(2);
-            limits.inference_workers.get_or_insert(1);
+            limits.inference_workers.get_or_insert(2);
         }
         if [
             limits.memory_bytes,

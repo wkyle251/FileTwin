@@ -1,7 +1,7 @@
 use filetwin_worker::{documents, media, raster};
 
 use filetwin_core::{Error, ErrorCode, Result, profile, worker_protocol as protocol};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 
 fn encode(request: &protocol::Request) -> Result<protocol::Encoded> {
     if request.version != protocol::VERSION {
@@ -29,24 +29,62 @@ fn encode(request: &protocol::Request) -> Result<protocol::Encoded> {
 }
 
 fn main() {
-    let result = (|| -> Result<protocol::Encoded> {
-        let mut input = Vec::new();
-        std::io::stdin()
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut input)?;
-        if input.len() > 64 * 1024 {
-            return Err(Error::invalid("Worker request too large"));
+    let serve = std::env::args().any(|a| a == "--serve");
+    let mut input = std::io::stdin().lock();
+    let mut watched = false;
+    loop {
+        let mut bytes = Vec::new();
+        let read = if serve {
+            input
+                .by_ref()
+                .take(64 * 1024 + 2)
+                .read_until(b'\n', &mut bytes)
+        } else {
+            input.by_ref().take(64 * 1024 + 1).read_to_end(&mut bytes)
+        };
+        if matches!(read, Ok(0)) {
+            break;
         }
-        let request: protocol::Request = serde_json::from_slice(&input)?;
-        watch_parent(request.parent_pid);
-        encode(&request)
-    })();
-    let response = protocol::Response {
-        version: protocol::VERSION,
-        result,
-    };
-    if let Ok(bytes) = serde_json::to_vec(&response) {
-        let _ = std::io::stdout().write_all(&bytes);
+        let started = std::time::Instant::now();
+        let result = (|| -> Result<protocol::Encoded> {
+            read?;
+            if bytes.len() > 64 * 1024 + usize::from(serve)
+                || (serve && bytes.last() != Some(&b'\n'))
+            {
+                return Err(Error::invalid(
+                    "Worker request exceeds framed protocol limit",
+                ));
+            }
+            let request: protocol::Request = serde_json::from_slice(&bytes)?;
+            if !watched {
+                watch_parent(request.parent_pid);
+                watched = true;
+            }
+            let mut encoded = encode(&request)?;
+            encoded.extraction["worker_seconds"] =
+                serde_json::json!(started.elapsed().as_secs_f64());
+            Ok(encoded)
+        })();
+        let response = protocol::Response {
+            version: protocol::VERSION,
+            result,
+        };
+        let output = serde_json::to_vec(&response).expect("Serializable response");
+        if output.len() > protocol::MAX_RESPONSE {
+            break;
+        }
+        let mut stdout = std::io::stdout().lock();
+        if stdout
+            .write_all(&output)
+            .and_then(|_| stdout.write_all(b"\n"))
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
+            break;
+        }
+        if !serve {
+            break;
+        }
     }
 }
 

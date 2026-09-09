@@ -5,9 +5,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
-    os::unix::process::CommandExt,
-    path::Path,
+    io::{Read, Write},
+    os::unix::{io::AsRawFd, process::CommandExt},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -15,13 +14,14 @@ use std::{
 /// Input is copied from the already opened source into private bounded staging.
 /// Native code never reopens the user's pathname. Each worker and its decoder
 /// descendants share a private process group, terminated on every exit path.
-pub(crate) fn encode(
+pub(crate) fn prepare(
     work: &mut Work<'_>,
     file: &mut File,
     format: &str,
     profile_id: &str,
     compute: bool,
-) -> Result<(protocol::Encoded, Option<String>)> {
+    reserved_staging: u64,
+) -> Result<Prepared> {
     let allowance = work.job.request.limits.as_ref().expect("Limits");
     let staging_bytes = allowance.staging_bytes.expect("Staging limit");
     let memory_bytes = allowance.memory_bytes.expect("Memory limit");
@@ -42,8 +42,9 @@ pub(crate) fn encode(
             ),
         ));
     }
-    // Reserve two bounded worker protocol files in addition to the input copy.
-    let source_limit = staging_bytes.saturating_sub(2 * protocol::MAX_RESPONSE as u64);
+    // Reserve bounded worker protocol buffers in addition to the input copy.
+    let source_limit = staging_bytes
+        .saturating_sub(reserved_staging.saturating_add(2 * protocol::MAX_RESPONSE as u64));
     if file.metadata()?.len() > source_limit {
         return Err(Error::new(
             ErrorCode::ResourceBudgetTooSmall,
@@ -92,51 +93,58 @@ pub(crate) fn encode(
         runtime: work.config.runtime.clone(),
         memory_bytes,
         parent_pid: std::process::id(),
+        inference_cache_dir: Some(work.config.data_dir.join("inference-cache")),
     };
-    let result = invoke(&work.config, &request, private.path(), &|| work.check());
-    match result {
-        Ok(encoded) => {
-            let id = if format == "media" {
-                request
-                    .profiles
-                    .get(&encoded.family)
-                    .map(String::as_str)
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorCode::WorkerFailed,
-                            "worker",
-                            "Unrequested media family",
-                        )
-                    })?
-            } else {
-                profile_id
-            };
-            let p = profile::find(id)?;
-            if encoded.family != p.family || encoded.vector.len() != p.dimensions {
-                return Err(Error::new(
-                    ErrorCode::WorkerFailed,
-                    "worker",
-                    "Worker returned an incompatible representation",
-                ));
-            }
-            profile::decode_vector(&profile::vector_bytes(&encoded.vector), p.dimensions).map_err(
-                |_| {
-                    Error::new(
-                        ErrorCode::WorkerFailed,
-                        "worker",
-                        "Worker returned an invalid vector",
-                    )
-                },
-            )?;
-            Ok((encoded, digest))
-        }
-        Err(mut e) => {
-            if let Some(digest) = digest {
-                e.details["digest"] = json!(digest);
-            }
-            Err(e)
-        }
+    Ok(Prepared {
+        request,
+        digest,
+        bytes,
+        _staged: staged,
+        _directory: private,
+    })
+}
+
+pub(crate) struct Prepared {
+    request: protocol::Request,
+    digest: Option<String>,
+    bytes: u64,
+    _staged: tempfile::NamedTempFile,
+    _directory: tempfile::TempDir,
+}
+
+fn validate_encoded(
+    request: &protocol::Request,
+    encoded: protocol::Encoded,
+) -> Result<protocol::Encoded> {
+    let id = if request.format == "media" {
+        request.profiles.get(&encoded.family).ok_or_else(|| {
+            Error::new(
+                ErrorCode::WorkerFailed,
+                "worker",
+                "Unrequested media family",
+            )
+        })?
+    } else {
+        &request.profile_id
+    };
+    let p = profile::find(id)?;
+    if encoded.family != p.family || encoded.vector.len() != p.dimensions {
+        return Err(Error::new(
+            ErrorCode::WorkerFailed,
+            "worker",
+            "Worker returned an incompatible representation",
+        ));
     }
+    profile::decode_vector(&profile::vector_bytes(&encoded.vector), p.dimensions).map_err(
+        |_| {
+            Error::new(
+                ErrorCode::WorkerFailed,
+                "worker",
+                "Worker returned an invalid vector",
+            )
+        },
+    )?;
+    Ok(encoded)
 }
 
 pub(crate) fn validate_runtime(config: &EngineConfig, family: &str, format: &str) -> Result<()> {
@@ -190,124 +198,313 @@ impl Drop for ProcessGroup {
     }
 }
 
-fn invoke(
-    config: &EngineConfig,
-    request: &protocol::Request,
-    directory: &Path,
-    check: &dyn Fn() -> Result<()>,
-) -> Result<protocol::Encoded> {
-    let mut input = tempfile::tempfile_in(directory)?;
-    let bytes = serde_json::to_vec(request)?;
-    if bytes.len() > 64 * 1024 {
-        return Err(Error::invalid("Native request exceeds protocol limit"));
+/// Shared admission count for the accepted event and the native coordinator.
+pub(crate) fn worker_count(request: &crate::api::JobRequest) -> usize {
+    let limits = request.limits.as_ref().expect("Resolved limits");
+    let requested = limits.inference_workers.unwrap_or(2) as usize;
+    let memory_slots = (limits.memory_bytes.unwrap_or(2 << 30) / (512 << 20)).max(1) as usize;
+    requested.min(memory_slots).clamp(1, 64)
+}
+
+pub(crate) struct Pool {
+    config: EngineConfig,
+    slots: Vec<Slot>,
+    memory_per_worker: u64,
+}
+
+struct Slot {
+    // Drop the process group before deleting a still-active staged source.
+    process: Option<Process>,
+    prepared: Option<Prepared>,
+    error: Option<Error>,
+}
+
+pub(crate) type Outcome = Result<(protocol::Encoded, Option<String>)>;
+
+impl Pool {
+    pub fn new(work: &Work<'_>) -> Self {
+        let n = worker_count(&work.job.request);
+        Self {
+            config: work.config.clone(),
+            slots: (0..n)
+                .map(|_| Slot {
+                    process: None,
+                    prepared: None,
+                    error: None,
+                })
+                .collect(),
+            memory_per_worker: work
+                .job
+                .request
+                .limits
+                .as_ref()
+                .unwrap()
+                .memory_bytes
+                .unwrap()
+                / n as u64,
+        }
     }
-    input.write_all(&bytes)?;
-    input.seek(SeekFrom::Start(0))?;
-    let mut stdout = tempfile::tempfile_in(directory)?;
-    let mut stderr = tempfile::tempfile_in(directory)?;
-    let mut command = Command::new(
-        config
-            .runtime
-            .worker_path
-            .as_ref()
-            .expect("Validated worker"),
-    );
-    command
-        .env_clear()
-        .env("LC_ALL", "C")
-        .env("OMP_NUM_THREADS", "1")
-        .current_dir(directory)
-        .process_group(0)
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::from(stdout.try_clone()?))
-        .stderr(Stdio::from(stderr.try_clone()?));
-    let memory = request.memory_bytes;
-    // SAFETY: pre_exec only calls async-signal-safe setrlimit and does not allocate
-    // or acquire locks. Limits affect the child and its descendants, not the host.
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+    pub fn active(&self) -> usize {
+        self.slots.iter().filter(|s| s.prepared.is_some()).count()
+    }
+    pub fn staged_bytes(&self) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|s| s.prepared.as_ref())
+            .map(|p| p.bytes + 2 * protocol::MAX_RESPONSE as u64)
+            .sum()
+    }
+    pub fn submit(&mut self, mut prepared: Prepared) -> usize {
+        let i = self
+            .slots
+            .iter()
+            .position(|s| s.prepared.is_none())
+            .expect("Admitted native slot");
+        prepared.request.memory_bytes = self.memory_per_worker;
+        let slot = &mut self.slots[i];
+        let result = (|| {
+            if slot.process.is_none() {
+                slot.process = Some(Process::spawn(&self.config, &prepared.request)?);
+            }
+            slot.process.as_mut().unwrap().begin(&prepared.request)
+        })();
+        slot.error = result.err();
+        slot.prepared = Some(prepared);
+        i
+    }
+    pub fn poll(&mut self) -> Option<(usize, Outcome)> {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.prepared.is_none() {
+                continue;
+            }
+            let result = if let Some(error) = slot.error.take() {
+                Some(Err(error))
+            } else {
+                slot.process.as_mut().unwrap().poll()
+            };
+            if let Some(result) = result {
+                let prepared = slot.prepared.take().unwrap();
+                let result = result.and_then(|e| validate_encoded(&prepared.request, e));
+                if result.is_err() {
+                    slot.process = None;
+                }
+                return Some((
+                    i,
+                    match result {
+                        Ok(encoded) => Ok((encoded, prepared.digest)),
+                        Err(mut error) => {
+                            if let Some(digest) = prepared.digest {
+                                error.details["digest"] = json!(digest);
+                            }
+                            Err(error)
+                        }
+                    },
+                ));
+            }
+        }
+        None
+    }
+}
+
+struct Process {
+    child: ProcessGroup,
+    input: std::process::ChildStdin,
+    output: std::process::ChildStdout,
+    errors: std::process::ChildStderr,
+    outgoing: Vec<u8>,
+    written: usize,
+    response: Vec<u8>,
+    diagnostics: Vec<u8>,
+    started: Instant,
+    _directory: tempfile::TempDir,
+}
+
+fn worker_error(message: impl Into<String>) -> Error {
+    Error::new(ErrorCode::WorkerFailed, "worker", message)
+}
+
+fn nonblocking(fd: std::os::fd::RawFd) -> Result<()> {
+    // SAFETY: fcntl modifies flags on our owned pipe, without transferring ownership.
     unsafe {
-        command.pre_exec(move || {
-            let output = libc::rlimit {
-                rlim_cur: protocol::MAX_RESPONSE as _,
-                rlim_max: protocol::MAX_RESPONSE as _,
-            };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &output) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let no_core = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            {
-                let cap = libc::rlimit {
-                    rlim_cur: memory,
-                    rlim_max: memory,
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+impl Process {
+    fn spawn(config: &EngineConfig, request: &protocol::Request) -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("filetwin-session-")
+            .tempdir_in(&config.temp_dir)?;
+        let mut command = Command::new(
+            config
+                .runtime
+                .worker_path
+                .as_ref()
+                .expect("Validated worker"),
+        );
+        command
+            .arg("--serve")
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("OMP_NUM_THREADS", "1")
+            .current_dir(directory.path())
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "linux")]
+        if !request.runtime.cuda_library_dirs.is_empty() {
+            let search = std::env::join_paths(&request.runtime.cuda_library_dirs)
+                .map_err(|_| Error::invalid("Invalid CUDA library search directories"))?;
+            command.env("LD_LIBRARY_PATH", search);
+        }
+        let memory = request.memory_bytes;
+        let uses_cuda = request
+            .profiles
+            .values()
+            .any(|id| profile::inference_backend(id).ok() == Some(profile::Backend::Cuda));
+        // SAFETY: this hook only calls async-signal-safe setrlimit; no allocation
+        // or host state changes occur after fork. GPU drivers reserve virtual
+        // address space independent of physical memory, so cannot use RLIMIT_AS.
+        unsafe {
+            command.pre_exec(move || {
+                let no_core = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
                 };
-                if libc::setrlimit(libc::RLIMIT_AS, &cap) != 0 {
+                if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-            }
-            #[cfg(target_os = "macos")]
-            let _ = memory; // macOS has no reliable per-process RSS rlimit.
-            Ok(())
-        });
-    }
-    let mut child = ProcessGroup(
-        command
-            .spawn()
-            .map_err(|e| Error::new(ErrorCode::WorkerFailed, "worker", e.to_string()))?,
-    );
-    let start = Instant::now();
-    let status = loop {
-        check()?;
-        if let Some(status) = child.0.try_wait()? {
-            break status;
+                #[cfg(target_os = "linux")]
+                if !uses_cuda {
+                    let cap = libc::rlimit {
+                        rlim_cur: memory,
+                        rlim_max: memory,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &cap) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = (memory, uses_cuda);
+                Ok(())
+            });
         }
-        if start.elapsed() >= Duration::from_secs(protocol::MAX_FILE_SECONDS) {
+        let mut child = ProcessGroup(command.spawn().map_err(|e| worker_error(e.to_string()))?);
+        let input = child.0.stdin.take().unwrap();
+        let output = child.0.stdout.take().unwrap();
+        let errors = child.0.stderr.take().unwrap();
+        for fd in [input.as_raw_fd(), output.as_raw_fd(), errors.as_raw_fd()] {
+            nonblocking(fd)?;
+        }
+        Ok(Self {
+            child,
+            input,
+            output,
+            errors,
+            outgoing: Vec::new(),
+            written: 0,
+            response: Vec::new(),
+            diagnostics: Vec::new(),
+            started: Instant::now(),
+            _directory: directory,
+        })
+    }
+
+    fn begin(&mut self, request: &protocol::Request) -> Result<()> {
+        self.outgoing = serde_json::to_vec(request)?;
+        if self.outgoing.len() > 64 * 1024 {
+            return Err(Error::invalid("Native request exceeds protocol limit"));
+        }
+        self.outgoing.push(b'\n');
+        self.written = 0;
+        self.response.clear();
+        self.diagnostics.clear();
+        self.started = Instant::now();
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<Result<protocol::Encoded>> {
+        match self.poll_io() {
+            Ok(None) => None,
+            Ok(Some(bytes)) => Some(
+                serde_json::from_slice::<protocol::Response>(&bytes)
+                    .map_err(|_| worker_error("Invalid native worker response"))
+                    .and_then(|r| {
+                        if r.version == protocol::VERSION {
+                            r.result
+                        } else {
+                            Err(worker_error(
+                                "Native worker version mismatch; rebuild both executables",
+                            ))
+                        }
+                    }),
+            ),
+            Err(mut error) => {
+                if !self.diagnostics.is_empty() {
+                    error.details["diagnostic"] = json!(String::from_utf8_lossy(
+                        &self.diagnostics[..self.diagnostics.len().min(4096)]
+                    ));
+                }
+                Some(Err(error))
+            }
+        }
+    }
+
+    fn poll_io(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.started.elapsed() >= Duration::from_secs(protocol::MAX_FILE_SECONDS) {
             return Err(Error::new(
                 ErrorCode::WorkerTimeout,
                 "worker",
                 "Native encoding exceeded the 300 second per-file deadline",
             ));
         }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    // Kill descendants before reading output, including a decoder left behind by
-    // an unexpected worker exit. The files eliminate pipe-full deadlocks.
-    drop(child);
-    stdout.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    stdout
-        .take((protocol::MAX_RESPONSE + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if !status.success() || bytes.len() > protocol::MAX_RESPONSE {
-        stderr.seek(SeekFrom::Start(0))?;
-        let mut diagnostic = Vec::new();
-        stderr.take(4096).read_to_end(&mut diagnostic)?;
-        let mut e = Error::new(
-            ErrorCode::WorkerFailed,
-            "worker",
-            format!("Native worker exited with {status}"),
-        );
-        e.details = Box::new(json!({"diagnostic":String::from_utf8_lossy(&diagnostic)}));
-        return Err(e);
+        while self.written < self.outgoing.len() {
+            match self.input.write(&self.outgoing[self.written..]) {
+                Ok(0) => return Err(worker_error("Worker closed its request pipe")),
+                Ok(n) => self.written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(worker_error(e.to_string())),
+            }
+        }
+        fn drain(reader: &mut impl Read, bytes: &mut Vec<u8>) -> Result<bool> {
+            let mut buffer = [0u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => return Ok(true),
+                    Ok(n) => {
+                        if bytes.len() + n > protocol::MAX_RESPONSE + 1 {
+                            return Err(worker_error("Native output exceeded protocol limit"));
+                        }
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(worker_error(e.to_string())),
+                }
+            }
+        }
+        drain(&mut self.errors, &mut self.diagnostics)?;
+        let eof = drain(&mut self.output, &mut self.response)?;
+        if let Some(end) = self.response.iter().position(|b| *b == b'\n') {
+            if end > protocol::MAX_RESPONSE || end + 1 != self.response.len() {
+                return Err(worker_error("Unexpected data after native response"));
+            }
+            return Ok(Some(self.response[..end].to_vec()));
+        }
+        if eof || self.child.0.try_wait()?.is_some() {
+            return Err(worker_error(
+                "Worker exited without a complete protocol response",
+            ));
+        }
+        Ok(None)
     }
-    let response: protocol::Response = serde_json::from_slice(&bytes).map_err(|_| {
-        Error::new(
-            ErrorCode::WorkerFailed,
-            "worker",
-            "Invalid native worker response",
-        )
-    })?;
-    if response.version != protocol::VERSION {
-        return Err(Error::new(
-            ErrorCode::WorkerFailed,
-            "worker",
-            "Native worker version mismatch",
-        ));
-    }
-    response.result
 }

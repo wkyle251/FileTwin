@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--ffmpeg", default=shutil.which("ffmpeg"))
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--backend", choices=["cpu", "reference", "coreml", "cuda"], default="cpu")
     args = parser.parse_args()
     binary = args.binary.resolve()
     model_dir = args.model_dir.resolve()
@@ -65,6 +66,8 @@ def main():
         def ffmpeg(*cmd):
             subprocess.run([args.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *map(str, cmd)], check=True, timeout=60)
         def cli(*cmd, expected=0):
+            if cmd and cmd[0] in ["scan", "index"]:
+                cmd = (*cmd, "--backend", args.backend)
             p = subprocess.run([str(binary), "--data-dir", str(data), "--model-dir", str(model_dir),
                                 "--ffmpeg-path", args.ffmpeg, "--format", "jsonl", *map(str, cmd)], capture_output=True, text=True, timeout=300)
             events = [json.loads(line) for line in p.stdout.splitlines()]
@@ -135,7 +138,12 @@ def main():
         for pair in pairs:
             if pair["match_kind"] == "similar_content":
                 assert ids[pair["file_a"]]["profile_id"] == ids[pair["file_b"]]["profile_id"] == pair["profile_id"]
+        report["backend"] = args.backend
         report["counts"] = summary["counts"]
+        for item in files:
+            if item["family"] in ["image", "video"]:
+                assert item["extraction"]["inference"]["backend"] == args.backend
+        assert any(item.get("extraction", {}).get("inference", {}).get("model_reused") for item in files)
         cached = cli("scan", source, "--experimental", "--threshold", "-1")
         assert cached["counts"]["cache_hits"] == len(files) and cached["counts"]["bytes_read"] == 0
         filtered = cli("scan", source / "audio-only.mp4", "--experimental", "--families", "audio", "--threshold", "0.95")

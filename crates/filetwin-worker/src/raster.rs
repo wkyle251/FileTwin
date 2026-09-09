@@ -4,12 +4,13 @@ use filetwin_core::{
 };
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage, imageops::FilterType};
 use ort::{
+    ep::{self, ExecutionProvider},
     session::{Session, builder::GraphOptimizationLevel},
     value::Tensor,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::Read};
+use std::{cell::RefCell, fs::File, io::Read, time::Instant};
 
 fn decode_error(e: impl std::fmt::Display) -> Error {
     Error::new(ErrorCode::DecodeFailed, "image", e.to_string())
@@ -28,6 +29,7 @@ fn model_error(e: impl std::fmt::Display) -> Error {
 
 pub struct Sscd {
     session: Session,
+    inference_seconds: f64,
 }
 impl Sscd {
     pub fn load(request: &Request) -> Result<Self> {
@@ -53,29 +55,105 @@ impl Sscd {
             .with_name("filetwin-worker")
             .with_telemetry(false)
             .commit();
-        let session = Session::builder()
+        let backend = profile::inference_backend(&request.profile_id)?;
+        let threads = if backend == profile::Backend::Reference {
+            1
+        } else {
+            request.runtime.inference_threads as usize
+        };
+        let mut builder = Session::builder()
             .map_err(model_error)?
-            .with_intra_threads(1)
+            .with_intra_threads(threads)
             .map_err(model_error)?
             .with_inter_threads(1)
             .map_err(model_error)?
             .with_parallel_execution(false)
             .map_err(model_error)?
-            .with_optimization_level(GraphOptimizationLevel::Disable)
-            .map_err(model_error)?
-            .commit_from_memory(&bytes)
+            .with_optimization_level(if backend == profile::Backend::Reference {
+                GraphOptimizationLevel::Disable
+            } else {
+                GraphOptimizationLevel::Level3
+            })
             .map_err(model_error)?;
-        Ok(Self { session })
+        let unavailable =
+            |message: String| Error::new(ErrorCode::RuntimeUnavailable, "inference", message);
+        let mut _cache_lock = None;
+        match backend {
+            profile::Backend::Coreml => {
+                if !cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                    || !ep::CoreML::default().is_available().unwrap_or(false)
+                {
+                    return Err(unavailable(
+                        "CoreML requires Apple Silicon macOS and a CoreML-enabled ONNX Runtime"
+                            .into(),
+                    ));
+                }
+                let mut provider = ep::CoreML::default()
+                    .with_model_format(ep::coreml::ModelFormat::MLProgram)
+                    .with_compute_units(ep::coreml::ComputeUnits::All)
+                    .with_static_input_shapes(true)
+                    .with_low_precision_accumulation_on_gpu(false);
+                if let Some(root) = &request.inference_cache_dir {
+                    let cache = root.join(format!("coreml-1.28.2-{}", profile::SSCD_MODEL_SHA256));
+                    std::fs::create_dir_all(&cache)?;
+                    // Serialize first compilation into a shared CoreML cache.
+                    let lock = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(cache.join("compile.lock"))?;
+                    fs2::FileExt::lock_exclusive(&lock)?;
+                    _cache_lock = Some(lock);
+                    provider = provider.with_model_cache_dir(cache.display());
+                }
+                builder = builder
+                    .with_execution_providers([provider.build().error_on_failure()])
+                    .map_err(|e| unavailable(e.to_string()))?;
+            }
+            profile::Backend::Cuda => {
+                if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                    return Err(unavailable(
+                        "CUDA profiles require Linux x86-64 with an NVIDIA GPU".into(),
+                    ));
+                }
+                crate::verify_cuda_providers(runtime)?;
+                let provider = ep::CUDA::default()
+                    .with_device_id(request.runtime.cuda_device_id)
+                    .with_tf32(false)
+                    .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic)
+                    .with_memory_limit(request.memory_bytes as usize);
+                builder = builder.with_execution_providers([provider.build().error_on_failure()])
+                    .map_err(|e| unavailable(format!("CUDA initialization failed; check the NVIDIA driver, CUDA 12 and cuDNN 9 libraries: {e}")))?;
+            }
+            _ => (),
+        }
+        let session = builder.commit_from_memory(&bytes).map_err(|error| {
+            if matches!(backend, profile::Backend::Coreml | profile::Backend::Cuda) {
+                unavailable(format!(
+                    "{} session could not initialize: {error}",
+                    backend.as_str()
+                ))
+            } else {
+                model_error(error)
+            }
+        })?;
+        Ok(Self {
+            session,
+            inference_seconds: 0.0,
+        })
     }
 
     pub fn tensor(&mut self, input: Vec<f32>) -> Result<Vec<f32>> {
         let input =
             Tensor::from_array(([1usize, 3, profile::IMAGE_SIZE, profile::IMAGE_SIZE], input))
                 .map_err(model_error)?;
+        let started = Instant::now();
         let output = self
             .session
             .run(ort::inputs!["image" => input])
             .map_err(model_error)?;
+        self.inference_seconds += started.elapsed().as_secs_f64();
         let (shape, values) = output["embedding"]
             .try_extract_tensor::<f32>()
             .map_err(model_error)?;
@@ -163,11 +241,54 @@ pub fn read_rgb(request: &Request) -> Result<(RgbImage, serde_json::Value)> {
 
 pub fn encode(request: &Request) -> Result<Encoded> {
     let (rgb, extraction) = read_rgb(request)?;
-    let vector = Sscd::load(request)?.rgb(&rgb)?;
-    Ok(Encoded {
-        family: "image".into(),
-        format: extraction["format"].as_str().unwrap_or("raster").into(),
-        vector,
-        extraction,
+    with_model(request, |model| {
+        Ok(Encoded {
+            family: "image".into(),
+            format: extraction["format"].as_str().unwrap_or("raster").into(),
+            vector: model.rgb(&rgb)?,
+            extraction,
+        })
+    })
+}
+
+thread_local! {
+    static MODEL: RefCell<Option<(String, Sscd)>> = const { RefCell::new(None) };
+}
+
+/// One immutable, verified session per worker, shared by images and video frames.
+/// A changed backend/runtime/budget replaces it before allocating another model.
+pub(crate) fn with_model(
+    request: &Request,
+    run: impl FnOnce(&mut Sscd) -> Result<Encoded>,
+) -> Result<Encoded> {
+    let backend = profile::inference_backend(&request.profile_id)?;
+    let key = serde_json::to_string(&(
+        backend,
+        &request.model_dir,
+        &request.runtime,
+        request.memory_bytes,
+        &request.inference_cache_dir,
+    ))?;
+    MODEL.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        let reused = cache.as_ref().is_some_and(|(old, _)| old == &key);
+        let started = Instant::now();
+        if !reused {
+            *cache = None;
+            *cache = Some((key, Sscd::load(request)?));
+        }
+        let load_seconds = if reused { 0.0 } else { started.elapsed().as_secs_f64() };
+        let model = &mut cache.as_mut().expect("Loaded model").1;
+        let previous = model.inference_seconds;
+        let mut encoded = run(model)?;
+        encoded.extraction["inference"] = json!({
+            "backend":backend, "model_reused":reused, "model_load_seconds":load_seconds,
+            "inference_seconds":model.inference_seconds-previous,
+            "intra_threads":if backend == profile::Backend::Reference { 1 } else { request.runtime.inference_threads },
+            "cuda_device_id":if backend == profile::Backend::Cuda { Some(request.runtime.cuda_device_id) } else { None },
+            "onnxruntime":"1.28.2", "graph_optimizations":backend != profile::Backend::Reference,
+            "cpu_node_fallback_allowed":matches!(backend, profile::Backend::Coreml | profile::Backend::Cuda),
+        });
+        Ok(encoded)
     })
 }

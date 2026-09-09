@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{io::Read, path::PathBuf};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_RESPONSE: usize = 1024 * 1024;
 pub const MAX_TEXT_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_FILE_SECONDS: u64 = 300;
@@ -23,6 +23,8 @@ pub struct Request {
     pub memory_bytes: u64,
     #[serde(default)]
     pub parent_pid: u32,
+    #[serde(default)]
+    pub inference_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

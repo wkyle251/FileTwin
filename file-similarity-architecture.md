@@ -51,18 +51,21 @@ Important differences from the target design:
   FFmpeg 9; the original image profile remains registered for old snapshots.
   OCR, legacy Office, slides/spreadsheets, SVG rendering, PQ/HLG HDR HEIF/AVIF/video,
   sidecars and remote providers remain unimplemented.
-- One native worker is started per file and reuses its model across video
-  frames. Reusing workers/models between files remains a throughput improvement.
+- A bounded pool reuses native workers and model sessions across files within
+  each job. Optimized CPU, CoreML and Linux x86-64 CUDA profiles have distinct IDs.
+  Short videos decode once while retaining the 32 midpoint targets; reference
+  profiles and old snapshots retain their original execution contracts.
   Native input uses one full bounded staged copy, so frame/audio sampling saves
   decode/inference work but does not avoid reading the original source bytes.
-- The scorer is the bounded reference implementation. BLAS kernels, parallel
+- The scorer is the bounded reference implementation. BLAS kernels, further
   extraction tuning, incremental pair-score reuse across snapshots and 10 TB measurements are
   deferred. Section 9's experiments do not measure the new executable.
   Filtering and grouping an existing full-score run reuse persisted scores.
 - `result_bytes` currently limits charged inventory/pair work and group
   reservations, not total database/WAL/publication/export bytes. Memory is bounded
   by implementation buffers and admission checks; Linux workers additionally
-  have an address-space limit, while macOS has no hard RSS ceiling.
+  have an address-space limit in CPU mode. CUDA workers instead set an arena
+  allowance, which is not a total GPU/process cap; macOS has no hard RSS ceiling.
   Global quotas, maintenance, tombstone reconciliation and retention are pending.
   Newly compared snapshots contain only the current job's observations.
   Native staging has a 300-second worker deadline and process-group cleanup.
@@ -73,11 +76,14 @@ Important differences from the target design:
   source retries are deferred. Root-parent aliases are resolved once, while the
   explicit root entry and discovered descendants are opened without following
   symlinks. This allows normal macOS `/var/folders/...` paths.
-- The local validation host is macOS 26.6.1 ARM64. CI is configured for the
-  selected native macOS/Ubuntu matrix; remote CI, the minimum OS floor, signed
-  distribution and other filesystems remain release qualification work.
+- The local validation host is macOS 26.6.1 ARM64. CI checks Rust builds, tests
+  and the CLI on the selected native macOS/Ubuntu matrix; full native-runtime/GPU
+  qualification, the minimum OS floor, signed distribution and other filesystems
+  remain release qualification work.
 
-Database schema version 2 and protocol version 1 are explicit preview formats.
+Database schema version 2 and public protocol version 1 are explicit preview
+formats. The private reusable-worker protocol is version 2; deploy matching
+`filetwin` and `filetwin-worker` binaries together.
 The engine transactionally upgrades v1 indexes by adding a grouping cursor;
 existing snapshots, vectors, IDs and publications remain unchanged. Read-only
 queries also accept v1 indexes. Older binaries refuse upgraded v2 indexes.
@@ -525,9 +531,15 @@ requiring newer glibc/C++ symbols than the baseline. Do not use the build machin
 detection and a tested baseline path, including inside native libraries.
 
 The default inference provider is **CPU on every selected platform**. A GPU is
-optional. Core ML on macOS and CUDA on Linux are later, explicit acceleration
-options after numerical and accuracy parity tests. Different backends cannot
-silently change profile compatibility or threshold decisions.
+optional. CoreML on Apple Silicon macOS and CUDA on Linux x86-64 are explicit
+experimental choices via `--experimental --backend coreml|cuda`. The default CPU
+profiles enable optimized inference; `--backend reference` selects the original
+CPU profiles. Backend-specific profile IDs prevent silently mixing vectors.
+CUDA deployment uses pinned ONNX Runtime CUDA 12/provider artifacts with an
+external compatible NVIDIA driver, CUDA 12 runtime and cuDNN 9. CPU fallback is an
+explicit backend choice; unavailable requested accelerators fail. Successfully
+registered providers may place unsupported nodes on CPU. See the
+[encoding implementation](native-encoding.md) for measurements and qualification.
 
 Keep platform differences behind the local-source and process adapters: raw
 filename bytes, file identity, case sensitivity, timestamps, no-follow opens,
@@ -567,7 +579,7 @@ packaging, accuracy calibration and the complete platform matrix remain pending.
 | Extraction input | Revision-bound seekable reader or bounded local materialization | Give parsers and decoders one content-access contract; record bytes fetched and decoded-input coverage. |
 | Format readers | Streaming UTF-8; `image` 0.25.10 with an explicit codec list; PDFium Chromium 8044 / `pdfium-render` 0.9.4; bounded `zip` 8.6.0 / `quick-xml` 0.42.0; FFmpeg 9 | Working experimental routes; each retains independent accuracy and platform release gates. |
 | Content hasher | Rust `sha2` SHA-256 behind the content-digest interface | Process bounded buffers and record digest algorithm, scope, and source revision. |
-| Encoding workers | Rust text feature hashing; `ort` pinned to `=2.0.0-rc.13` with ONNX Runtime 1.28.2 CPU for neural evaluation | Pin the prerelease binding behind an internal adapter; reuse loaded models and validate conversion/parity before promotion. |
+| Encoding workers | Rust text feature hashing; `ort` pinned to `=2.0.0-rc.13` with ONNX Runtime 1.28.2 CPU/CoreML/CUDA for neural evaluation | Pin the prerelease binding behind an internal adapter; reuse loaded models and validate conversion/parity before promotion. |
 | Vector store | `rusqlite` 0.40.1 with SQLite and binary vector payloads | CLI enables bundled SQLite; core exposes an optional bundling feature so embedding hosts control native linkage. Enforce section 13's durability/version checks in either mode. |
 | Batch matcher | Apple Accelerate on macOS; OpenBLAS on Linux; portable reference scorer for correctness | Compute compatible vector blocks with bounded native threads. Qualify threshold decisions against the reference on all targets. |
 | Retrieval planner | Rust; exact blocks initially, optional approximate backend later | Estimate pair/output cost and record the chosen completeness policy; score candidates using the original vectors. |
@@ -709,10 +721,12 @@ Catalog::export(ExportRequest) -> Result<ExportManifest, Error>
 `submit` validates the request, persists acceptance, and returns a handle while
 engine workers perform the job. Initially, one engine accepts one active
 processing job at a time and reports `engine_busy` for another; it still runs
-bounded per-file workers. The current preview runs one isolated native process
-per file and reuses the model for that video's frames. A persistent worker pool
-that reuses loaded models and buffers across files/jobs remains the target for
-throughput tuning. A CLI invocation coordinates the entire scan.
+bounded native workers. The preview now reuses each isolated process and verified
+model session across files within a job, using bounded protocol-v2 JSON lines.
+The coordinator drains all process pipes without blocking and owns source checks,
+SQLite commits and progress. It replaces failed workers and tears down every
+worker group at job termination. Reuse across jobs remains deferred. A CLI
+invocation coordinates the entire scan.
 Load models lazily for operations that encode. Comparing cached vectors requires
 profile definitions and the scoring backend, but not decoder executables or
 original model weights. Queries do not initialize scoring or encoding runtimes.
@@ -1821,6 +1835,9 @@ library does not read these environment variables or search for config files.
 | `EngineConfig.model_dir` / `temp_dir` | Required absolute artifact/staging directories, chosen by the host. |
 | `EngineConfig.defaults` | Optional typed profile, matching, cache, and resource defaults; resolve them only for applicable operations. |
 | `EngineConfig.runtime` | Absolute worker/decoder/runtime locations, CPU inference by default, and native thread counts; record the actual validated backend and counts. The CLI resolves executable discovery before constructing this configuration. |
+| `EngineConfig.runtime.inference_threads` | Implemented: 1–64 intra-operation threads per model session, default 2; reference profiles use 1. |
+| `EngineConfig.runtime.cuda_device_id` | Implemented: nonnegative NVIDIA device index, default 0; CUDA profiles require Linux x86-64 and the pinned CUDA 12 runtime. |
+| `EngineConfig.runtime.cuda_library_dirs` | Implemented: explicit absolute library search directories for CUDA/cuDNN dependencies; workers do not inherit the host's `LD_LIBRARY_PATH`. |
 | `HostServices.credentials` | Credential resolver/refresh implementation for configured connections; not serializable job data. |
 | `HostServices.diagnostics` | Caller-owned diagnostic callback/sink; independent of the job event receiver. |
 
@@ -1881,6 +1898,7 @@ new processing defaults.
 | `--recursive` / `--no-recursive` | `recursive` | `scan`, `index`; default true. |
 | `--families text,image,audio,video` | `families[]` | `scan`, `index`; an empty list is invalid. |
 | `--profile FAMILY=PROFILE_ID` | `profiles[FAMILY]` | Repeat for different selected families in `scan`, `index`. |
+| `--backend cpu\|reference\|coreml\|cuda` | Select backend-specific image/video `profiles` | Implemented with `--experimental` for `scan`, `index`; CPU is the default. There is no serialized job field named `backend`. |
 | `--pair-scope SCOPE` | `pair_scope` | `all_selected` or `within_each_source`; `scan`, `compare`. |
 | `--retrieval exact` | `matching.retrieval` | `scan`, `compare`; reject approximate mode until implemented. |
 | `--threshold PROFILE_ID=SCORE` | `matching.threshold_overrides[PROFILE_ID]` | Repeat for distinct compatible profiles in `scan`, `compare`, `group`; a bare score applies to all selected profiles. |
@@ -2028,7 +2046,7 @@ Resolve and persist exact values for every job before accepting it.
 | `limits.staging_bytes` | `--staging-bytes N` | `10737418240` (10 GiB); materialized originals and temporary media. |
 | `limits.result_bytes` | `--result-bytes N` | `1073741824` (1 GiB); job pair evidence, groups, and result publications. |
 | `limits.io_workers` | `--io-workers N` | `2`; bound file/source concurrency. |
-| `limits.inference_workers` | `--inference-workers N` | `1`; account for each model's native thread pools separately. |
+| `limits.inference_workers` | `--inference-workers N` | `2`; effective count capped at 64 and one per 512 MiB (at least one). Memory is divided across workers; each optimized session defaults to two threads. |
 | `limits.download_bytes` | `--download-bytes N` | `null`, no caller-imposed total transfer cap; `0` explicitly forbids content transfer. |
 | `limits.download_bytes_per_second` | `--bandwidth-bytes-per-second N` | `null`, no caller-imposed bandwidth cap; otherwise positive. |
 | `limits.wall_time_seconds` | `--max-runtime-seconds N` | `null`, no job deadline; otherwise positive accumulated running time across attempts, excluding pauses between them. |

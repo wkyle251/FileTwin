@@ -25,7 +25,7 @@ def main():
     vectors = []
     cases = []
     for path in args.images:
-        request = {"version":1, "path":str(path.resolve()), "format":"raster", "profile_id":"",
+        request = {"version":2, "path":str(path.resolve()), "format":"raster", "profile_id":"",
                    "model_dir":str(args.model_dir.resolve()), "runtime":{"onnxruntime_path":str(args.model_dir.resolve()/f"runtime/libonnxruntime.{suffix}")}, "memory_bytes":2*1024**3}
         p = subprocess.run([str(args.harness.resolve())], input=json.dumps(request).encode(), capture_output=True, check=True, timeout=60)
         values = np.frombuffer(p.stdout, dtype="<f4")

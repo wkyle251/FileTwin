@@ -2,15 +2,65 @@
   "onnxruntime": {
     "version": "1.28.2",
     "base_url": "https://github.com/microsoft/onnxruntime/releases/download/v1.28.2/",
-    "macos-aarch64": {"archive":"onnxruntime-osx-arm64-1.28.2.tgz","sha256":"c4fceacfc53765d0869dc9180c31ec91054d149017a99d1e80ffe28dc79596de","member":"onnxruntime-osx-arm64-1.28.2/lib/libonnxruntime.1.28.2.dylib","library_sha256":"c986ef16fd63406bc2cee8cc7cc056189b07c587beb9b79d29e31c3cca129e98"},
-    "linux-x86_64": {"archive":"onnxruntime-linux-x64-1.28.2.tgz","sha256":"d7209b8751b27b862b0c76332c2e20e203396edb5dab700ecf4bb485cf147415","member":"onnxruntime-linux-x64-1.28.2/lib/libonnxruntime.so.1.28.2","library_sha256":"088f24b1fc56714d3efaaeb3ac2ee486a5d7b50ccfbb3dd26fd1a612534a05fb"},
-    "linux-aarch64": {"archive":"onnxruntime-linux-aarch64-1.28.2.tgz","sha256":"f020b3d31106cc7db03889b4a5c21e7c38ce4a09ad26119c11d1ad6d3fa0ec04","member":"onnxruntime-linux-aarch64-1.28.2/lib/libonnxruntime.so.1.28.2","library_sha256":"01fc142511bd585db60446eb7531e07cc4160e90fb4664fe04a988457d62305f"}
+    "macos-aarch64": {
+      "archive": "onnxruntime-osx-arm64-1.28.2.tgz",
+      "sha256": "c4fceacfc53765d0869dc9180c31ec91054d149017a99d1e80ffe28dc79596de",
+      "member": "onnxruntime-osx-arm64-1.28.2/lib/libonnxruntime.1.28.2.dylib",
+      "library_sha256": "c986ef16fd63406bc2cee8cc7cc056189b07c587beb9b79d29e31c3cca129e98"
+    },
+    "linux-x86_64": {
+      "archive": "onnxruntime-linux-x64-1.28.2.tgz",
+      "sha256": "d7209b8751b27b862b0c76332c2e20e203396edb5dab700ecf4bb485cf147415",
+      "member": "onnxruntime-linux-x64-1.28.2/lib/libonnxruntime.so.1.28.2",
+      "library_sha256": "088f24b1fc56714d3efaaeb3ac2ee486a5d7b50ccfbb3dd26fd1a612534a05fb"
+    },
+    "linux-aarch64": {
+      "archive": "onnxruntime-linux-aarch64-1.28.2.tgz",
+      "sha256": "f020b3d31106cc7db03889b4a5c21e7c38ce4a09ad26119c11d1ad6d3fa0ec04",
+      "member": "onnxruntime-linux-aarch64-1.28.2/lib/libonnxruntime.so.1.28.2",
+      "library_sha256": "01fc142511bd585db60446eb7531e07cc4160e90fb4664fe04a988457d62305f"
+    },
+    "linux-x86_64-cuda12": {
+      "archive": "onnxruntime-linux-x64-gpu_cuda12-1.28.2.tgz",
+      "sha256": "e172d4d52bc4399ca36553bd9705389adae900b1f1e08ade50078db1c84b6c1f",
+      "member": "onnxruntime-linux-x64-gpu_cuda12-1.28.2/lib/libonnxruntime.so.1.28.2",
+      "library_sha256": "c439a1812a3b0c703f9a31f926a73d538cc49828d33dc70cc9e307d4bbd99247",
+      "providers": [
+        {
+          "member": "onnxruntime-linux-x64-gpu_cuda12-1.28.2/lib/libonnxruntime_providers_shared.so",
+          "file": "libonnxruntime_providers_shared.so",
+          "sha256": "c6a12593396095f5670160e284c35d1700b7708cf3037b7042e2a5200ccae772"
+        },
+        {
+          "member": "onnxruntime-linux-x64-gpu_cuda12-1.28.2/lib/libonnxruntime_providers_cuda.so",
+          "file": "libonnxruntime_providers_cuda.so",
+          "sha256": "435b0190ede487b400432fa161227e287bd8e973b54c21ef788e7a30ce5966f2"
+        }
+      ],
+      "cuda_major": 12,
+      "cudnn_major": 9
+    }
   },
   "pdfium": {
     "version": "chromium/8044",
     "base_url": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8044/",
-    "macos-aarch64": {"archive":"pdfium-mac-arm64.tgz","sha256":"61424884d4a7f153b808deba6437848e4400834ce30aaf95d3050da44df8f420","member":"lib/libpdfium.dylib","library_sha256":"f151baf68cf7c4ebee7e7b9263bdce065436b8df7008fb174d89dd2a97fac124"},
-    "linux-x86_64": {"archive":"pdfium-linux-x64.tgz","sha256":"eb142f416aed3a72fc5a02dbd5884868a16cb99dc0cf53e6bdd64afbf67b05f4","member":"lib/libpdfium.so","library_sha256":"b0361f8ba0bc6ffeb2325949a88f08b09356f46abe257ffdf846202999daa27b"},
-    "linux-aarch64": {"archive":"pdfium-linux-arm64.tgz","sha256":"e98400ef5f005f27cfba5c14f72d464e25187298f04950de46646033cf24cef0","member":"lib/libpdfium.so","library_sha256":"794a43ec86642d48ed69becb6923022cd0b34d23c81c524452d6f0549398d710"}
+    "macos-aarch64": {
+      "archive": "pdfium-mac-arm64.tgz",
+      "sha256": "61424884d4a7f153b808deba6437848e4400834ce30aaf95d3050da44df8f420",
+      "member": "lib/libpdfium.dylib",
+      "library_sha256": "f151baf68cf7c4ebee7e7b9263bdce065436b8df7008fb174d89dd2a97fac124"
+    },
+    "linux-x86_64": {
+      "archive": "pdfium-linux-x64.tgz",
+      "sha256": "eb142f416aed3a72fc5a02dbd5884868a16cb99dc0cf53e6bdd64afbf67b05f4",
+      "member": "lib/libpdfium.so",
+      "library_sha256": "b0361f8ba0bc6ffeb2325949a88f08b09356f46abe257ffdf846202999daa27b"
+    },
+    "linux-aarch64": {
+      "archive": "pdfium-linux-arm64.tgz",
+      "sha256": "e98400ef5f005f27cfba5c14f72d464e25187298f04950de46646033cf24cef0",
+      "member": "lib/libpdfium.so",
+      "library_sha256": "794a43ec86642d48ed69becb6923022cd0b34d23c81c524452d6f0549398d710"
+    }
   }
 }

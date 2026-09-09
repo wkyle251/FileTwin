@@ -113,6 +113,23 @@ pub struct Engine {
 }
 impl Engine {
     pub fn open(mut config: EngineConfig, host: HostServices) -> Result<Self> {
+        if !(1..=64).contains(&config.runtime.inference_threads)
+            || config.runtime.cuda_device_id < 0
+        {
+            return Err(Error::invalid(
+                "inference_threads must be 1..64 and cuda_device_id must be nonnegative",
+            ));
+        }
+        if config
+            .runtime
+            .cuda_library_dirs
+            .iter()
+            .any(|p| !p.is_absolute() || !p.is_dir())
+        {
+            return Err(Error::invalid(
+                "CUDA library directories must be absolute existing directories",
+            ));
+        }
         for p in [&config.data_dir, &config.model_dir, &config.temp_dir] {
             if !p.is_absolute() {
                 return Err(Error::invalid("Engine directories must be absolute"));
@@ -270,7 +287,7 @@ impl Engine {
         let work_cancel = cancel.clone();
         let owner = self.owner.clone();
         let worker_completion = completion.clone();
-        send.try_send(JobEvent::Accepted{job_id:job.id.clone(),run_id:job.run.clone(),data:json!({"attempt_id":job.attempt,"status":"queued","resolved_request":job.request,"provenance":{"app_version":env!("CARGO_PKG_VERSION"),"scorer":"filetwin_cosine_f64_v1","encoder_workers":1,"max_native_workers":1,"native_worker_policy":"isolated_per_file","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH}})}).expect("Empty event queue");
+        send.try_send(JobEvent::Accepted{job_id:job.id.clone(),run_id:job.run.clone(),data:json!({"attempt_id":job.attempt,"status":"queued","resolved_request":job.request,"provenance":{"app_version":env!("CARGO_PKG_VERSION"),"scorer":"filetwin_cosine_f64_v1","encoder_workers":crate::native::worker_count(&job.request),"max_native_workers":crate::native::worker_count(&job.request),"native_worker_policy":"bounded_reusable_processes_per_job","inference_threads":cfg.runtime.inference_threads,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH}})}).expect("Empty event queue");
         let job_id = job.id.clone();
         let fallback_job = job.clone();
         let fallback_config = cfg.clone();

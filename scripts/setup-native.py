@@ -62,12 +62,21 @@ def main():
     parser.add_argument("--assets-dir", type=Path, default=ROOT / "target/native-assets")
     parser.add_argument("--conversion-python", type=Path, help="Build-only Python with model-requirements.txt installed")
     parser.add_argument("--onnx", type=Path, help="Use an already converted, checksum-verified model (no PyTorch required)")
+    parser.add_argument("--onnxruntime-variant", choices=["cpu", "cuda12"], default="cpu",
+                        help="cuda12 installs the NVIDIA provider for Linux x86-64; requires CUDA 12 and cuDNN 9")
+    parser.add_argument("--target", choices=["macos-aarch64", "linux-x86_64", "linux-aarch64"],
+                        help="Explicit deployment target for provisioning; defaults to this machine")
     args = parser.parse_args()
     model_dir = args.model_dir.resolve()
     assets = args.assets_dir.resolve()
     system = {"Darwin": "macos", "Linux": "linux"}.get(platform.system())
     arch = {"arm64":"aarch64", "aarch64":"aarch64", "x86_64":"x86_64", "AMD64":"x86_64"}.get(platform.machine())
     target = f"{system}-{arch}"
+    if args.target:
+        target = args.target
+        system, arch = target.split("-", 1)
+    if args.onnxruntime_variant == "cuda12" and target != "linux-x86_64":
+        raise SystemExit("The pinned CUDA 12 runtime is available for Linux x86-64 only")
     lock = json.loads((ROOT / "crates/filetwin-worker/runtime-artifacts.json").read_text())
     if target not in lock["onnxruntime"]:
         raise SystemExit(f"No native artifacts pinned for {target}")
@@ -87,7 +96,8 @@ def main():
             atomic_copy(output, onnx)
     installed = {"target":target,"model_sha256":expected,"model_source":SOURCE_URL,"artifacts":{}}
     for component, platforms in lock.items():
-        artifact = platforms[target]
+        artifact_target = target + "-cuda12" if component == "onnxruntime" and args.onnxruntime_variant == "cuda12" else target
+        artifact = platforms[artifact_target]
         archive = fetch(platforms["base_url"] + artifact["archive"], assets / artifact["archive"], artifact["sha256"])
         suffix = "dylib" if system == "macos" else "so"
         destination = model_dir / "runtime" / f"lib{component}.{suffix}"
@@ -102,6 +112,16 @@ def main():
             if sha(output) != artifact["library_sha256"]:
                 raise RuntimeError("Native library checksum mismatch")
             atomic_copy(output, destination)
+            for provider in artifact.get("providers", []):
+                member = tar.getmember(provider["member"])
+                if not member.isfile() or Path(provider["file"]).name != provider["file"]:
+                    raise RuntimeError("Invalid pinned provider member")
+                output = Path(tmp) / provider["file"]
+                with tar.extractfile(member) as source, output.open("wb") as out:
+                    shutil.copyfileobj(source, out)
+                if sha(output) != provider["sha256"]:
+                    raise RuntimeError("CUDA provider checksum mismatch")
+                atomic_copy(output, destination.parent / provider["file"])
             # Preserve all shipped license/notice texts; never extract archive
             # paths directly, and never create links from an archive.
             for notice in tar.getmembers():
@@ -116,6 +136,8 @@ def main():
     (model_dir / "installed-artifacts.json").write_text(json.dumps(installed, indent=2) + "\n")
     print(f"Verified native assets installed at {model_dir}")
     print("FFmpeg 9 and ffprobe 9 must be installed separately; run filetwin doctor to inspect paths.")
+    if args.onnxruntime_variant == "cuda12":
+        print("CUDA backend also requires a compatible NVIDIA driver, CUDA 12 runtime and cuDNN 9; these are not downloaded by this script.")
 
 
 if __name__ == "__main__":

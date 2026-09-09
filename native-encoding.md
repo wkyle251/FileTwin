@@ -15,6 +15,8 @@ profile. Comparisons and groups require equal family **and** profile ID. A
 | `experimental-image-sscd-v2` | Same SSCD representation; expanded reader policy | First raster image/frame with EXIF orientation, or FFmpeg 9 primary SDR HEIF/AVIF image including tile-grid reconstruction and crop/rotation. RGB8, alpha on black, triangle resize directly to 320×320, official ImageNet channel normalization |
 | `experimental-audio-landmarks-v1` | 4,096-dimensional signed spectral-peak-triplet sketch | First audio stream, mono 16 kHz; up to 32 disjoint eight-second windows centered across the timeline. Files up to 256 seconds cover the complete timeline. FFT 1024/hop 256, periodic Hann; peak triples at offsets (7,3,0), (15,7,0), (31,15,0), (63,31,0); signed square-root counts and L2 normalization. |
 | `experimental-video-sscd-v1` | Mean of normalized SSCD frame descriptors, then L2 normalization | 32 midpoint targets across the entire timeline, deduplicated by decoded PTS. The first frame is a fallback if no midpoint yields a frame. Actual integer PTS, time base, seconds and missing targets are retained. Audio and temporal order are excluded. |
+| `experimental-image-sscd-{cpu,coreml,cuda}-v1` | Same model and image preprocessing, optimized execution | Separate backend-specific IDs; optimized CPU is the new default. CoreML and CUDA are explicit choices. |
+| `experimental-video-sscd-{cpu,coreml,cuda}-v1` | Same model and 32 midpoint targets, optimized execution | Clips up to 60 seconds use one continuous decode with targets rounded to the stream time base; longer clips retain sparse seeks. Backend and decoder policy are included in the profile ID. |
 
 `profiles list` is the authoritative source for profile IDs and full manifests.
 Both audio pooling and video averaging lose some temporal information. Short
@@ -63,21 +65,31 @@ copy and model/runtime reads are not counted again as source I/O. Before saving
 a result, the coordinator verifies the source's descriptor and pathname still
 refer to the observed revision. Fast freshness remains heuristic.
 
-The companion receives an internal versioned JSON request through a bounded
-file. The public CLI protocol is separate. Worker stdout/stderr are private,
-size-limited files, so native output cannot corrupt JSONL or block the host on a
-full pipe. The coordinator checks cancellation and job time while waiting, with
-a 300-second per-file ceiling. A private process group contains the worker and
-all FFmpeg children. Cancellation, failure and normal termination clean up the
-group and staging; a worker also terminates its group if its host disappears.
-Crash-staging garbage collection and model reuse between files remain later work.
+The companion receives internal protocol-v2 JSON lines through nonblocking pipes
+(64 KiB requests and 1 MiB responses/diagnostics). Both executables must be rebuilt
+together. The public CLI protocol remains v1. The coordinator drains stdout and
+stderr while checking cancellation and job time; a full pipe cannot block it.
+Native processes handle one request at a time and are reused within one job,
+including a verified model session shared by images and video frames. A failed or
+malformed worker is discarded and replaced for subsequent files. A private
+process group contains each worker and its FFmpeg descendants. Cancellation,
+timeouts and job termination kill all groups and remove staging; a worker also
+terminates its group if its host disappears. Per-file source revision validation
+and all database writes remain on the coordinator. Crash-staging garbage
+collection and reuse across jobs remain later work.
 
-Native source staging must fit `staging_bytes` minus a 2 MiB protocol reserve.
+The sum of active native staging must fit `staging_bytes`, reserving an additional
+2 MiB for each pending file. File growth is checked against the remaining allowance.
 The default is 10 GiB and can be raised for larger files. Buffers and image
 dimensions are capped. Native document/audio admission requires 128 MiB;
 image/video requires 512 MiB. Larger frames can require a higher allowance.
-Linux additionally applies a worker address-space limit. macOS has no reliable
-hard RSS limit. These are developer safeguards, not demonstrated 10 TB capacity.
+The native worker count defaults to two and is capped at 64 and one per 512 MiB
+of the job memory allowance (at least one). Each worker receives an equal share
+of that allowance. Lower the count for unusually large decoded inputs. Linux
+CPU workers have an address-space limit; CUDA workers omit it because GPU drivers
+reserve large virtual ranges, and configure the CUDA arena allowance instead.
+CUDA's arena is not a total GPU/process memory cap. macOS has no reliable hard
+RSS limit. These are developer safeguards, not demonstrated 10 TB capacity.
 
 DOCX XML is bounded to 32 MiB, 256 nesting levels, 4,096 ZIP entries and an 8 MiB
 central directory. ZIP64/multi-volume packages, DTDs, external entities and
@@ -99,12 +111,30 @@ explicit provisioning, not a processing dependency. It verifies:
   and removes exporter diagnostics to keep the artifact reproducible.
 - ONNX Runtime 1.28.2 and PDFium Chromium 8044 archive/library SHA-256 values in
   [runtime-artifacts.json](crates/filetwin-worker/runtime-artifacts.json).
-- Native worker model and library checksums again before inference/loading.
+- Native worker model and library checksums again before inference/loading;
+  reused sessions continue to use those verified in-memory artifacts.
+- CUDA 12 Linux x86-64 runtime and CUDA/shared provider libraries, when explicitly
+  selected during setup. CUDA 12, cuDNN 9 and an NVIDIA driver are supplied by the
+  deployment environment. TensorRT is not selected or bundled by FileTwin setup.
 
 `ort`/`ort-sys` are pinned to `2.0.0-rc.13` with binary-download features off.
-ONNX inference uses CPU, one thread, sequential execution and disabled graph
-optimizations. Model memory is verified before loading. FFmpeg and ffprobe must
-be version 9; their full version strings are recorded in file provenance.
+Reference profiles retain one CPU thread and disabled graph optimizations.
+Optimized profiles enable level-3 graph optimizations, sequential graph execution
+and bounded intra-op threads (default two). CoreML uses MLProgram with all compute
+units eligible and low-precision GPU accumulation disabled; CUDA uses device 0
+by default, heuristic convolution search and TF32 disabled. Model precision and
+operator fallback still depend on the provider, so each backend has distinct
+profile IDs and must be qualified independently. A requested GPU that cannot
+initialize fails explicitly, while successfully initialized providers can execute
+unsupported graph nodes on CPU. Per-file extraction records include backend,
+thread count, model reuse and loading/inference/worker timings.
+
+CoreML compilation is serialized across workers and cached under the data
+directory, keyed by runtime version and model SHA-256. This generated cache is
+outside staging/result allowances and can be removed while no job is running to
+force recompilation. CUDA library search directories are explicit host settings;
+worker environments do not inherit `LD_LIBRARY_PATH`. FFmpeg and ffprobe remain
+version 9 and their full version strings are recorded in file provenance.
 
 Deploy `filetwin`, its sibling `filetwin-worker`, and the provisioned model/runtime
 directory plus notices. The target-specific runtime libraries differ across
@@ -127,6 +157,10 @@ cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo build --locked --release --workspace --bins --examples
 python3 scripts/native-smoke.py target/release/filetwin --model-dir .filetwin/models
+# Apple Silicon, using the same provisioned assets:
+python3 scripts/native-smoke.py target/release/filetwin --model-dir .filetwin/models --backend coreml
+# Linux x86-64 with the CUDA 12 bundle and installed NVIDIA dependencies:
+python3 scripts/native-smoke.py target/release/filetwin --model-dir .filetwin/models --backend cuda
 python3 scripts/setup-format-fixtures.py --directory target/format-fixtures
 python3 scripts/format-smoke.py target/release/filetwin --model-dir .filetwin/models \
   --heif-fixtures target/format-fixtures
@@ -141,3 +175,59 @@ video transcode/timestamps/short clips, unrelated noise recordings, family parti
 comparison without originals, malformed/blank inputs, staging limits and native
 orphan cleanup. The parity harness sends the exact Rust-preprocessed tensor to
 the official TorchScript model and compares the returned components.
+
+## Optimization validation
+
+Measured locally on 2026-09-09, Apple M5 Pro (18 CPU cores, 64 GiB RAM), macOS
+ARM64, release build, pinned SSCD/ONNX Runtime 1.28.2 and FFmpeg 9.0.1.
+The same 24-file sample contained 12 images and 12 videos. Each run used a
+separate index, `--cache-mode refresh` and `--exact-duplicates compute`, with
+no cached vectors. Filesystem and operating-system model caches were not cleared;
+these single runs describe this sample, not a general hardware guarantee.
+
+| Encoding path | Wall time, including staging and hashing | Speedup over old executable |
+| --- | ---: | ---: |
+| Pre-optimization executable, one worker/thread, model loaded per file | 68.219 s | 1× |
+| Optimized CPU, 2 workers × 2 inference threads | 11.871 s | 5.7× |
+| CoreML, 2 workers, new FileTwin compilation-cache directory | 6.271 s | 10.9× |
+
+Both optimized paths selected exactly the original video's decoded timestamps
+for every sample clip. Minimum original/optimized vector cosine was greater
+than 0.99999999997. Across all compatible image/image and video/video pairs,
+the largest absolute score change was 8.58e-7 for CPU and 5.05e-7 for CoreML.
+Each optimized run loaded two model sessions and reused them for the other 22
+files. These checks establish agreement on this sample; backend-specific profile
+IDs remain separate because arithmetic and supported operations can vary.
+
+A separate full-collection check covered 355 files (181 images, 173 videos and
+one metadata file that failed strict UTF-8 decoding). Fresh CoreML encoding and
+whole-file hashing took **79.855 s**, compared with **988.762 s** in the previous
+run, a 12.4× improvement. All 354 media files remained ready; their original
+contents, modification times and recorded hashes were unchanged. Every video's
+decoded timestamps matched the old run. The largest absolute change among all
+31,168 compatible pair scores was 9.02e-7. After caching immutable profile
+definitions, a full saved-vector comparison took **1.800 s** versus the previous
+2.426 s. Comparison continues to use the same CPU cosine calculation.
+
+Local checks passed: 55 workspace tests; formatting and Clippy with warnings
+denied; release binaries/examples; all 11 generated schemas; native integration
+checks on CPU and CoreML; and 72 format fixtures on optimized CPU, including
+HEIC primary/grid/transformed images and AVIF. Regression tests cover real
+concurrent worker admission, process reuse/replacement, cancellation and decoder
+cleanup, source changes during encoding, staging limits, zero-read caches,
+legacy profile identities, and explicit backend selection.
+The original reference path also passed TorchScript tensor/inference parity;
+explicit CUDA selection on macOS produced `runtime_unavailable` and no vector.
+Actual optimized-run envelopes, accepted requests and summaries validated
+against the public schemas.
+
+The Linux x86-64 CUDA 12 bundle was provisioned from Microsoft's official
+archive. Its archive, core runtime, CUDA provider and shared-provider checksums
+were verified, and the installed libraries were identified as x86-64 ELF.
+**NVIDIA inference, numerical agreement, memory use and speed remain untested
+on physical NVIDIA hardware.** Run the CUDA smoke command above on the target
+machine; selecting CUDA reports initialization failures instead of substituting
+a CPU profile. Other Linux/macOS release qualification remains separate.
+
+Private collection paths, source files, vectors and detailed timing logs remain
+in the ignored local `target` directory and are not distributed with the source.

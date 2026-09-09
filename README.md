@@ -83,6 +83,9 @@ cosine `0.95` does not mean a 95% probability that two files are duplicates.
 
 ## Calculate scores, then filter or group
 
+For faster encoding and optional Apple/NVIDIA acceleration, see
+[Encoding performance and GPU support](#encoding-performance-and-gpu-support).
+
 Use this workflow when a CLI caller or another application chooses the cutoff
 after seeing the scores. All paths below are local; scan data and reports should
 remain outside the source repository or in a Git-ignored directory.
@@ -446,10 +449,12 @@ the complete record, including nested and lossless path fields.
 | `--request-id TEXT` | Correlation ID for flags/queries; `run` takes it from JSON |
 | `--progress-interval-ms N` | Event throttle; default 1000 ms |
 
-Run each command with `--help` for all parameters. `--io-workers` and
-`--inference-workers` are accepted upper bounds; this preview uses one encoder
-and one reference scorer. Native encoding stages one file at a time from its
-already opened source; the source is checked again before saving its vector.
+Run each command with `--help` for all parameters. Native encoders use a bounded
+pool of reusable processes. `--inference-workers` defaults to 2 and controls
+concurrent native files; the effective count also depends on the memory allowance.
+Discovery, text hashing and source staging run on the coordinator;
+`--io-workers` remains an upper bound with one staging reader. Comparison uses
+one reference scorer. Each original is checked again before saving its vector.
 Staging is removed after success, error or cancellation. Native workers have a
 300-second per-file deadline, also bounded by the job's remaining time. No
 network content is fetched. Image/video admission requires 512 MiB; native
@@ -692,7 +697,9 @@ require a new job; they cannot be increased through `resume`.
   reuse across snapshots. `group` and score queries reuse an existing score run.
   This preview has **not** demonstrated 10 TB performance.
 - The memory setting governs admission and bounded internal buffers. Linux
-  native workers also have an address-space limit; macOS has no hard RSS limit.
+  CPU workers also have an address-space limit; CUDA workers use a bounded
+  inference arena because GPU drivers require large virtual address ranges.
+  This is not a total GPU memory ceiling; macOS has no hard RSS limit.
   Result allowance counts serialized inventory/pair work and
   group reservations; it is **not** a limit on SQLite, WAL, exports, publication
   copies, or lifetime disk use. Global quotas, pruning, backup/restore and cache
@@ -706,8 +713,9 @@ require a new job; they cannot be increased through `resume`.
   explicit. FileTwin never moves or deletes originals.
 - The planned release targets are Apple Silicon macOS 14+ and Ubuntu 24.04/26.04
   on x86-64/ARM64. This implementation was exercised locally on **macOS 26.6.1
-  ARM64**. The [CI matrix](.github/workflows/ci.yml) uses native hosted runners;
-  those remote runs and minimum-version qualification remain pending. Ubuntu
+  ARM64**. The [CI matrix](.github/workflows/ci.yml) checks Rust builds, tests and
+  the CLI on native hosted runners; full native-runtime/GPU and minimum-version
+  qualification remain pending. Ubuntu
   26.04 runner availability is currently a public preview. See GitHub's
   [runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
@@ -732,6 +740,101 @@ python3 scripts/format-smoke.py target/release/filetwin --model-dir .filetwin/mo
 Regenerate schemas by omitting `--check` from the schema command. See the
 [validation record](implementation-plan.md#validation-record) for completed
 checks and remaining release gates.
+
+## Encoding performance and GPU support
+
+`--experimental` now selects optimized CPU image/video profiles by default.
+FileTwin reuses the model within each native worker and processes native files
+concurrently. Optimized video profiles decode clips up to 60 seconds once,
+selecting the same 32 midpoint targets rounded to the stream time base. Longer
+clips use sparse seeks. Sampling is not reduced to obtain the speedup.
+
+On an Apple M5 Pro, a 24-file sample (12 images and 12 videos) took **68.2 s
+before this optimization, 11.9 s with optimized CPU, and 6.3 s with CoreML**.
+These are fresh-index encoding/hash times from one local run, approximately
+5.7× and 10.9× faster; filesystem/system caches were not cleared. NVIDIA timing
+has not been measured. See the [benchmark and validation record](native-encoding.md#optimization-validation)
+for settings and vector-agreement checks.
+
+| Backend | CLI selection with `--experimental` | Deployment requirements |
+| --- | --- | --- |
+| Optimized CPU (default) | `--backend cpu` | Existing pinned native assets; macOS ARM64 and Linux x86-64/ARM64. |
+| Apple GPU / Neural Engine | `--backend coreml` | Apple Silicon macOS and the pinned CoreML-enabled ONNX Runtime. CoreML chooses hardware for supported operations. |
+| NVIDIA GPU | `--backend cuda` | Linux x86-64, the pinned CUDA 12 ONNX Runtime bundle, compatible NVIDIA driver, CUDA 12 runtime libraries and cuDNN 9. |
+| Original CPU reference | `--backend reference` | Original image-v2/video-v1 profiles, one inference thread and graph optimizations disabled. Worker/model reuse still applies. |
+
+```sh
+# Portable optimized CPU, with two concurrent native files and two threads each.
+./target/release/filetwin --data-dir .filetwin scan /absolute/path/to/files \
+  --experimental --backend cpu --inference-workers 2 --inference-threads 2 \
+  --all-scores --format jsonl
+
+# Apple Silicon: use the same model directory and explicitly select CoreML.
+./target/release/filetwin --data-dir .filetwin scan /absolute/path/to/files \
+  --experimental --backend coreml --all-scores --format jsonl
+
+# Linux x86-64 with NVIDIA: explicitly install the CUDA 12 runtime variant.
+# --onnx points to the existing checksum-verified model; alternatively use
+# --conversion-python as in the initial setup instructions.
+python3 scripts/setup-native.py --model-dir .filetwin/models \
+  --onnx .filetwin/models/sscd_disc_mixup.onnx --onnxruntime-variant cuda12
+./target/release/filetwin --data-dir .filetwin scan /absolute/path/to/files \
+  --experimental --backend cuda --cuda-device-id 0 --inference-workers 1 \
+  --all-scores --format jsonl
+```
+
+Setup installs and verifies ONNX Runtime plus its CUDA/shared provider libraries;
+it does not install an NVIDIA driver, CUDA toolkit/runtime or cuDNN. The system
+loader must find those dependencies. For nonstandard locations, repeat
+`--cuda-library-dir /absolute/path/to/lib`; the library equivalent is
+`EngineConfig.runtime.cuda_library_dirs`. The worker does not inherit the host's
+`LD_LIBRARY_PATH`. See the [ONNX CUDA requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html).
+`setup-native.py --target linux-x86_64` also supports provisioning a deployment
+bundle from another host. Production encoding remains native Rust; Python is a
+setup/test tool. Docker is optional.
+
+An explicitly requested unavailable GPU produces `runtime_unavailable`; FileTwin
+does not silently substitute a CPU profile. Supported GPU sessions may execute
+unsupported model operations on CPU. Select `--backend cpu` for the portable
+fallback. GPU support accelerates the image model and video frame embeddings;
+text/document features, audio fingerprints, hashing and comparison remain on CPU.
+
+`--inference-workers N` is capped at 64 and at one worker per 512 MiB of the total
+memory allowance (at least one worker). The allowance is divided across those
+workers; large images may need `--memory-bytes` increased or fewer workers.
+`--inference-threads N` accepts 1–64, defaults to 2, and applies per model session;
+reference profiles always use one. `--cuda-device-id N` selects a nonnegative
+CUDA device index. CUDA's arena receives a per-worker allowance, but neither it
+nor macOS provides a hard total CPU/GPU memory ceiling. CUDA workers do not apply
+Linux `RLIMIT_AS`, which conflicts with GPU virtual-address reservations.
+
+The public JSON request stores the selected **profile IDs** and existing
+`limits.inference_workers`; `--backend` is a CLI shortcut for selecting profiles,
+not a JSON request field. Obtain IDs with `profiles list`. Rust callers can use
+`JobRequest::experimental_scores_with_backend(paths, profile::Backend::Coreml)`
+or `experimental_scan_with_backend(paths, cutoff, backend)`. Set
+`EngineConfig.runtime.inference_threads` and `cuda_device_id` as needed.
+
+Accepted events report the effective worker count. Ready image/video file records
+include `extraction.inference` with `backend`, `model_reused`, `model_load_seconds`,
+`inference_seconds`, thread count and CUDA device, plus `extraction.worker_seconds`.
+Video records include `decoder_strategy` and the actual sampled frame timestamps.
+Existing file/progress counts and result matrices retain their formats.
+Rebuild and deploy both `filetwin` and `filetwin-worker` together: the internal
+worker protocol is now version 2; the public JSON schema remains version 1.
+
+Reference, optimized CPU, CoreML and CUDA profiles have different IDs. Old
+snapshots remain readable and retain their original meaning; selecting another
+backend recomputes affected vectors. Cross-profile matrix cells are incompatible,
+even when dimensions match. Accelerated arithmetic can shift scores slightly,
+so cutoffs remain caller choices. CoreML compilation is cached under
+`DATA_DIR/inference-cache`, keyed by model checksum/runtime version; this cache
+is separate from vector reuse and is outside the staging/result allowances.
+
+To reuse unchanged vectors on later scans, keep the same data directory and
+profiles and use `--cache-mode reuse` (the default). `--cache-mode refresh`
+deliberately encodes again. See [native-encoding.md](native-encoding.md) for the
+validation record and remaining platform qualification.
 
 ## License
 

@@ -51,6 +51,7 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
     work.job.counts.locations = 0;
     work.checkpoint()?;
     let namespace = store::namespace(&work.db)?;
+    let mut queue = EncodingQueue::new(work);
     loop {
         work.check()?;
         let task=work.db.query_row("SELECT id,source_id,path,root,depth FROM directory_tasks WHERE job_id=?1 AND done=0 ORDER BY id LIMIT 1",[&work.job.id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,Vec<u8>>(3)?,r.get::<_,u32>(4)?))).optional()?;
@@ -69,7 +70,9 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
             let handle = local::open_secure(&path)?;
             let meta = handle.metadata()?;
             if meta.is_file() {
-                return process_file(work, &path, &root, &source, &namespace, &filters, &excluded);
+                return process_file(
+                    work, &mut queue, &path, &root, &source, &namespace, &filters, &excluded,
+                );
             }
             if !meta.is_dir() {
                 return Err(Error::new(
@@ -112,7 +115,7 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
                     }
                 } else if metadata.is_file() {
                     process_file(
-                        work, &child, &root, &source, &namespace, &filters, &excluded,
+                        work, &mut queue, &child, &root, &source, &namespace, &filters, &excluded,
                     )?;
                 } else {
                     excluded_entry(
@@ -158,6 +161,7 @@ pub(crate) fn discover(work: &mut Work<'_>) -> Result<()> {
             .execute("UPDATE directory_tasks SET done=1 WHERE id=?1", [task_id])?;
         work.checkpoint()?;
     }
+    queue.finish_all(work)?;
     refresh_counts(work)?;
     work.job.counts.files_total = Some(work.job.counts.files_processed);
     work.checkpoint()
@@ -171,8 +175,10 @@ fn excluded_entry(work: &mut Work<'_>, path: &Path, source: &str, reason: &str) 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_file(
     work: &mut Work<'_>,
+    queue: &mut EncodingQueue,
     path: &Path,
     root: &Path,
     source: &str,
@@ -180,6 +186,7 @@ fn process_file(
     filters: &FilterSet,
     excluded: &[PathBuf],
 ) -> Result<()> {
+    queue.drain_ready(work)?;
     if local::excluded_artifact(path, excluded) {
         return excluded_entry(work, path, source, "filetwin_artifact");
     }
@@ -219,6 +226,9 @@ fn process_file(
             work.file_error(e.for_file(source, Some(&fid)))?;
             return failed_observation(work, path, source, &fid, &revision, "failed", None);
         }
+    }
+    while queue.contains(&fid) {
+        queue.wait_one(work)?;
     }
     let prior = work
         .db
@@ -352,8 +362,144 @@ fn process_file(
                 extraction: json!({"coverage":"complete_source_text","characters":e.characters}) }, e.digest)
         })
     } else {
-        native::encode(work, &mut file, format, &p.profile_id, compute)
+        queue.admit(work, revision.bytes)?;
+        match native::prepare(
+            work,
+            &mut file,
+            format,
+            &p.profile_id,
+            compute,
+            queue.pool.staged_bytes(),
+        ) {
+            Ok(prepared) => {
+                let context = PendingFile {
+                    file,
+                    path: path.to_owned(),
+                    source: source.to_owned(),
+                    fid,
+                    revision,
+                    family: family.to_owned(),
+                    format: format.to_owned(),
+                    known_digest,
+                };
+                let slot = queue.pool.submit(prepared);
+                queue.pending[slot] = Some(context);
+                return Ok(());
+            }
+            Err(error) => Err(error),
+        }
     };
+    finish_file(
+        work,
+        PendingFile {
+            file,
+            path: path.to_owned(),
+            source: source.to_owned(),
+            fid,
+            revision,
+            family: family.to_owned(),
+            format: format.to_owned(),
+            known_digest,
+        },
+        encoded,
+    )
+}
+
+struct PendingFile {
+    file: File,
+    path: PathBuf,
+    source: String,
+    fid: String,
+    revision: Revision,
+    family: String,
+    format: String,
+    known_digest: Option<String>,
+}
+
+struct EncodingQueue {
+    pool: native::Pool,
+    pending: Vec<Option<PendingFile>>,
+}
+
+impl EncodingQueue {
+    fn new(work: &Work<'_>) -> Self {
+        let pool = native::Pool::new(work);
+        let pending = (0..pool.capacity()).map(|_| None).collect();
+        Self { pool, pending }
+    }
+    fn contains(&self, fid: &str) -> bool {
+        self.pending.iter().flatten().any(|p| p.fid == fid)
+    }
+    fn drain_ready(&mut self, work: &mut Work<'_>) -> Result<()> {
+        while let Some((slot, outcome)) = self.pool.poll() {
+            work.check()?;
+            finish_file(
+                work,
+                self.pending[slot].take().expect("Pending source"),
+                outcome,
+            )?;
+        }
+        Ok(())
+    }
+    fn wait_one(&mut self, work: &mut Work<'_>) -> Result<()> {
+        loop {
+            work.check()?;
+            if let Some((slot, outcome)) = self.pool.poll() {
+                return finish_file(
+                    work,
+                    self.pending[slot].take().expect("Pending source"),
+                    outcome,
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fn admit(&mut self, work: &mut Work<'_>, bytes: u64) -> Result<()> {
+        let allowance = work
+            .job
+            .request
+            .limits
+            .as_ref()
+            .unwrap()
+            .staging_bytes
+            .unwrap();
+        let reservation = bytes.saturating_add(2 * crate::worker_protocol::MAX_RESPONSE as u64);
+        while self.pool.active() == self.pool.capacity()
+            || (self.pool.active() > 0
+                && self.pool.staged_bytes().saturating_add(reservation) > allowance)
+        {
+            self.wait_one(work)?;
+        }
+        Ok(())
+    }
+    fn finish_all(&mut self, work: &mut Work<'_>) -> Result<()> {
+        while self.pool.active() > 0 {
+            self.wait_one(work)?;
+        }
+        Ok(())
+    }
+}
+
+fn finish_file(work: &mut Work<'_>, context: PendingFile, encoded: native::Outcome) -> Result<()> {
+    let PendingFile {
+        mut file,
+        path,
+        source,
+        fid,
+        revision,
+        family,
+        format,
+        known_digest,
+    } = context;
+    let (path, source, fid, revision, family, format) = (
+        path.as_path(),
+        source.as_str(),
+        fid.as_str(),
+        &revision,
+        family.as_str(),
+        format.as_str(),
+    );
+    let compute = work.job.request.exact_duplicates == Some(ExactDuplicates::Compute);
     let encoded = match encoded {
         Ok(value) => value,
         Err(error) => {
@@ -373,8 +519,8 @@ fn process_file(
             ) {
                 return Err(error);
             }
-            if !still_current(&file, path, &revision) {
-                return changed(work, path, source, &fid, &revision);
+            if !still_current(&file, path, revision) {
+                return changed(work, path, source, fid, revision);
             }
             let mut digest = error
                 .details
@@ -385,8 +531,8 @@ fn process_file(
             if compute && digest.is_none() {
                 file.seek(SeekFrom::Start(0))?;
                 digest = Some(read_digest(work, &mut file)?);
-                if !still_current(&file, path, &revision) {
-                    return changed(work, path, source, &fid, &revision);
+                if !still_current(&file, path, revision) {
+                    return changed(work, path, source, fid, revision);
                 }
             }
             let state = if error.code == ErrorCode::InsufficientContent {
@@ -404,10 +550,10 @@ fn process_file(
                 .to_owned();
             if state != "excluded" {
                 work.job.source_partial = true;
-                work.file_error(error.for_file(source, Some(&fid)))?;
+                work.file_error(error.for_file(source, Some(fid)))?;
             }
             let payload = json!({"file_id":fid,"family":actual_family,"format":format,"locator":local::locator(path),"bytes":revision.bytes,"state":state,"reason":if state=="excluded"{Some("unselected_family")}else{None},"profile_id":null,"vector_id":null,"sha256":digest,"revision":revision,"revision_key":revision.key(),"observed_at":store::now()});
-            save_observation(work, path, source, &fid, &payload, true)?;
+            save_observation(work, path, source, fid, &payload, true)?;
             refresh_counts(work)?;
             return work.checkpoint();
         }
@@ -422,14 +568,14 @@ fn process_file(
             .and_then(|p| p.get(&encoded.family))
             .expect("Validated result family"),
     )?;
-    if !still_current(&file, path, &revision) {
-        return changed(work, path, source, &fid, &revision);
+    if !still_current(&file, path, revision) {
+        return changed(work, path, source, fid, revision);
     }
     // Re-open through the no-follow path to ensure the location still names the
     // opened object before publishing it; an open descriptor survives renames.
     match local::open_secure(path).and_then(|f| Ok(Revision::of(&f.metadata()?))) {
         Ok(r) if r.key() == revision.key() => (),
-        _ => return changed(work, path, source, &fid, &revision),
+        _ => return changed(work, path, source, fid, revision),
     }
     let bytes = profile::vector_bytes(&encoded.vector);
     let checksum = profile::digest_hex(&bytes);
@@ -444,7 +590,7 @@ fn process_file(
         "INSERT OR IGNORE INTO vectors(id,profile_id,payload,checksum) VALUES(?1,?2,?3,?4)",
         params![vector_id, p.profile_id, bytes, checksum],
     )?;
-    save_observation(work, path, source, &fid, &payload, true)?;
+    save_observation(work, path, source, fid, &payload, true)?;
     work.job.counts.vectors_encoded += 1;
     refresh_counts(work)?;
     work.checkpoint()

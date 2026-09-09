@@ -3,6 +3,24 @@
 Date: 2026-09-09
 Status: milestone 1, all-family encoding, and saved-score/matrix implementation complete; qualification/maintenance remain planned
 
+## Encoding performance and accelerators
+
+- [x] Preserve reference profiles and introduce explicit optimized CPU, CoreML and CUDA image/video profiles with separate identities and recorded backend provenance.
+- [x] Reuse isolated inference processes and models, and pipeline a bounded number of native files while keeping database writes, progress, source validation and result publication on the coordinator.
+- [x] Expose backend selection and native worker limits through the CLI and Rust API; retain CPU operation without GPU libraries and report unavailable explicitly requested accelerators.
+- [x] Provision checksum-pinned Linux x86-64 CUDA runtime/provider libraries alongside the existing CPU and macOS runtime choices; document driver/CUDA/cuDNN requirements.
+- [x] Add per-file timing evidence and validate cancellation, worker crashes, resource bounds, cached profiles and accelerated/reference vector agreement.
+- [x] Benchmark fresh image/video encoding on the local Mac, run workspace checks, and document measured results and the limits of NVIDIA hardware validation.
+
+Short videos decode once with the original midpoint/time-base rounding; longer
+clips retain sparse seeking. Immutable profile definitions are cached to avoid
+rebuilding manifests during exhaustive comparison. The local sample improved
+from 68.2 s to 11.9 s on CPU and 6.3 s on CoreML. See the
+[optimization validation record](native-encoding.md#optimization-validation)
+for settings, full-collection results and tests. NVIDIA bundle provisioning and
+checksums were verified; physical NVIDIA inference/performance qualification
+remains open and is not implied by implementation completion.
+
 ## Caller progress counters
 
 - [x] Expose processed inventory counts and nullable totals through JSONL progress, status, summaries and the Rust API; leave percentage calculation to callers.

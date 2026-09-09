@@ -32,6 +32,7 @@ fn config(tmp: &Path, worker_body: &str) -> EngineConfig {
         ffprobe_path: Some(worker),
         onnxruntime_path: Some(dummy.clone()),
         pdfium_path: Some(dummy),
+        ..RuntimeConfig::default()
     };
     config
 }
@@ -60,7 +61,7 @@ fn mixed_dimensions_profiles_cache_and_frozen_comparison() {
     let cfg = config(
         &tmp,
         &format!(
-            "request=$(/bin/cat)\ncase \"$request\" in *'\"format\":\"media\"'*) /bin/cat '{}' ;; *) /bin/cat '{}' ;; esac",
+            "while IFS= read -r request; do\ncase \"$request\" in *'\"format\":\"media\"'*) /bin/cat '{}' ;; *) /bin/cat '{}' ;; esac\nprintf '\\n'\ndone",
             tmp.join("video.json").display(),
             tmp.join("image.json").display()
         ),
@@ -127,7 +128,7 @@ fn matrices_keep_incompatible_profiles_null_even_when_dimensions_match() {
     let cfg = config(
         &root,
         &format!(
-            "request=$(/bin/cat)\ncase \"$request\" in *'\"format\":\"media\"'*) /bin/cat '{}' ;; *) /bin/cat '{}' ;; esac",
+            "while IFS= read -r request; do\ncase \"$request\" in *'\"format\":\"media\"'*) /bin/cat '{}' ;; *) /bin/cat '{}' ;; esac\nprintf '\\n'\ndone",
             root.join("video.json").display(),
             root.join("image.json").display()
         ),
@@ -313,4 +314,182 @@ fn known_digests_survive_profile_changes_and_vector_refresh() {
     assert_eq!(refreshed.counts.vectors_encoded, 2);
     assert_eq!(refreshed.counts.bytes_hashed, 0);
     assert_eq!(refreshed.counts.exact_pairs, 1);
+}
+
+#[test]
+fn native_pool_runs_concurrently_reuses_processes_and_collapses_hardlinks() {
+    let temp = tempfile::tempdir().unwrap();
+    let tmp = temp.path().canonicalize().unwrap();
+    let starts = tmp.join("starts");
+    fs::create_dir(&starts).unwrap();
+    response(&tmp.join("response.json"), "image", 512);
+    // Neither first request can finish until both workers have received work.
+    // This asserts concurrency without relying on a performance timing cutoff.
+    let cfg = config(
+        &tmp,
+        &format!(
+            r#"
+while IFS= read -r request; do
+    /usr/bin/touch '{starts}/'$$
+    attempts=0
+    while [ "$(/bin/ls '{starts}' | /usr/bin/wc -l)" -lt 2 ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 500 ] || exit 19
+        /bin/sleep 0.01
+    done
+    /bin/cat '{response}'
+    printf '\n'
+done
+"#,
+            starts = starts.display(),
+            response = tmp.join("response.json").display()
+        ),
+    );
+    let staging = cfg.temp_dir.clone();
+    let input = tmp.join("input");
+    fs::create_dir(&input).unwrap();
+    for i in 0..6 {
+        fs::write(input.join(format!("{i}.png")), b"\x89PNG\r\n\x1a\n").unwrap();
+    }
+    let alias = tmp.join("alias.png");
+    fs::hard_link(input.join("0.png"), &alias).unwrap();
+    let engine = Engine::open(cfg, HostServices::default()).unwrap();
+    let mut request = JobRequest::experimental_scores([input, alias]);
+    request.limits = Some(Limits {
+        inference_workers: Some(2),
+        ..Limits::default()
+    });
+    let summary = engine.submit(request.clone()).unwrap().wait().unwrap();
+    assert_eq!(summary.status, "completed", "{summary:?}");
+    assert_eq!(
+        (
+            summary.counts.files_ready,
+            summary.counts.locations,
+            summary.counts.vectors_encoded
+        ),
+        (6, 7, 6)
+    );
+    assert_eq!(
+        fs::read_dir(starts).unwrap().count(),
+        2,
+        "Processes should be reused"
+    );
+    assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
+    let cached = engine.submit(request).unwrap().wait().unwrap();
+    assert_eq!((cached.counts.cache_hits, cached.counts.bytes_read), (6, 0));
+}
+
+#[test]
+fn a_crashed_native_process_is_replaced_for_the_next_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let tmp = temp.path().canonicalize().unwrap();
+    response(&tmp.join("response.json"), "image", 512);
+    let cfg = config(
+        &tmp,
+        &format!(
+            r#"
+while IFS= read -r request; do
+    if [ ! -e '{marker}' ]; then
+        /usr/bin/touch '{marker}'
+        exit 17
+    fi
+    /bin/cat '{response}'
+    printf '\n'
+done
+"#,
+            marker = tmp.join("crashed").display(),
+            response = tmp.join("response.json").display()
+        ),
+    );
+    let input = tmp.join("input");
+    fs::create_dir(&input).unwrap();
+    for i in 0..3 {
+        fs::write(input.join(format!("{i}.png")), b"\x89PNG\r\n\x1a\n").unwrap();
+    }
+    let engine = Engine::open(cfg, HostServices::default()).unwrap();
+    let mut request = JobRequest::experimental_scores([input]);
+    request.limits = Some(Limits {
+        inference_workers: Some(1),
+        ..Limits::default()
+    });
+    let summary = engine.submit(request).unwrap().wait().unwrap();
+    assert_eq!(
+        (summary.counts.files_ready, summary.counts.files_failed),
+        (2, 1),
+        "{summary:?}"
+    );
+    assert_eq!(summary.counts.files_processed, 3);
+    assert_eq!(summary.counts.files_total, Some(3));
+}
+
+#[test]
+fn a_source_changed_while_a_native_request_is_pending_is_not_published() {
+    let temp = tempfile::tempdir().unwrap();
+    let tmp = temp.path().canonicalize().unwrap();
+    response(&tmp.join("response.json"), "image", 512);
+    let marker = tmp.join("encoding");
+    let release = tmp.join("release");
+    let cfg = config(
+        &tmp,
+        &format!(
+            r#"
+while IFS= read -r request; do
+    /usr/bin/touch '{marker}'
+    while [ ! -e '{release}' ]; do /bin/sleep 0.01; done
+    /bin/cat '{response}'
+    printf '\n'
+done
+"#,
+            marker = marker.display(),
+            release = release.display(),
+            response = tmp.join("response.json").display()
+        ),
+    );
+    let source = tmp.join("image.png");
+    fs::write(&source, b"\x89PNG\r\n\x1a\n").unwrap();
+    let engine = Engine::open(cfg, HostServices::default()).unwrap();
+    let job = engine
+        .submit(JobRequest::experimental_scores([source.clone()]))
+        .unwrap();
+    let start = Instant::now();
+    while !marker.exists() {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(source, b"\x89PNG\r\n\x1a\nchanged").unwrap();
+    fs::write(release, []).unwrap();
+    let summary = job.wait().unwrap();
+    assert_eq!(
+        (summary.counts.files_ready, summary.counts.files_failed),
+        (0, 1),
+        "{summary:?}"
+    );
+    assert_eq!(summary.counts.vectors_encoded, 0);
+}
+
+#[test]
+fn accelerated_profiles_keep_legacy_ids_and_separate_backends() {
+    assert_eq!(
+        profile::image_profile_v2().profile_id,
+        "sha256:88a7383952aabd98b9bc41e66b355fc569e9070697040026e4476db04408700b"
+    );
+    assert_eq!(
+        profile::video_profile_v1().profile_id,
+        "sha256:b9b098920072811527446fcf68330b717817561f3eae28012410dfbebb2fd93b"
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    for backend in [
+        profile::Backend::Reference,
+        profile::Backend::Cpu,
+        profile::Backend::Coreml,
+        profile::Backend::Cuda,
+    ] {
+        for p in profile::experimental_profiles_for(backend)
+            .into_iter()
+            .filter(|p| p.requires_model)
+        {
+            assert!(ids.insert(p.profile_id.clone()));
+            assert_eq!(profile::inference_backend(&p.profile_id).unwrap(), backend);
+        }
+    }
 }

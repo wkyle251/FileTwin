@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 pub const DIMENSIONS: usize = 4096;
 pub const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
@@ -190,7 +191,7 @@ pub fn image_profile_v1() -> Profile {
     )
 }
 
-pub fn image_profile() -> Profile {
+pub fn image_profile_v2() -> Profile {
     let mut manifest = image_profile_v1().manifest;
     manifest["decoder"] = json!({
         "raster":"image_rs_0_25_jpeg_png_gif_webp_tiff_bmp_ico_pnm_tga_dds_qoi_farbfeld_hdr_exr",
@@ -232,7 +233,7 @@ pub fn audio_profile() -> Profile {
     )
 }
 
-pub fn video_profile() -> Profile {
+pub fn video_profile_v1() -> Profile {
     experimental(
         "experimental-video-sscd-v1",
         "video",
@@ -251,25 +252,119 @@ pub fn video_profile() -> Profile {
     )
 }
 
-pub fn experimental_profiles() -> Vec<Profile> {
+/// Execution choices have distinct profile identities; reference snapshots keep
+/// their original preprocessing and inference contract.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    Reference,
+    #[default]
+    Cpu,
+    Coreml,
+    Cuda,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Cpu => "cpu",
+            Self::Coreml => "coreml",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+fn accelerated(mut p: Profile, backend: Backend) -> Profile {
+    if backend == Backend::Reference {
+        return p;
+    }
+    let representation = &mut p.manifest["representation"];
+    representation["runtime"] = json!("onnxruntime_1_28_2");
+    representation["execution_provider"] = json!(backend);
+    representation["inference"] =
+        json!("float32_io_sequential_graph_optimization_level3_bounded_threads");
+    representation["precision_policy"] = json!(match backend {
+        Backend::Coreml => "coreml_mlprogram_all_compute_units_no_low_precision_gpu_accumulation",
+        Backend::Cuda => "cuda_tf32_disabled_heuristic_conv_search",
+        _ => "cpu_float32",
+    });
+    if p.family == "video" {
+        p.manifest["decoder_execution"] =
+            json!("continuous_midpoint_crossings_up_to_60_seconds_otherwise_sparse_seeks");
+        p.manifest["continuous_target_rounding"] = json!("nearest_stream_time_base_tick");
+    }
+    experimental(
+        &format!("experimental-{}-sscd-{}-v1", p.family, backend.as_str()),
+        &p.family,
+        p.dimensions,
+        true,
+        p.manifest,
+    )
+}
+
+pub fn image_profile() -> Profile {
+    accelerated(image_profile_v2(), Backend::Cpu)
+}
+
+pub fn video_profile() -> Profile {
+    accelerated(video_profile_v1(), Backend::Cpu)
+}
+
+pub fn inference_backend(id: &str) -> crate::Result<Backend> {
+    let p = find(id)?;
+    Ok(
+        match p.manifest["representation"]["execution_provider"].as_str() {
+            Some("cpu") => Backend::Cpu,
+            Some("coreml") => Backend::Coreml,
+            Some("cuda") => Backend::Cuda,
+            _ => Backend::Reference,
+        },
+    )
+}
+
+pub fn experimental_profiles_for(backend: Backend) -> Vec<Profile> {
     vec![
         document_profile(),
-        image_profile(),
+        accelerated(image_profile_v2(), backend),
         audio_profile(),
-        video_profile(),
+        accelerated(video_profile_v1(), backend),
     ]
 }
 
+pub fn experimental_profiles() -> Vec<Profile> {
+    experimental_profiles_for(Backend::Cpu)
+}
+
 pub fn profiles() -> Vec<Profile> {
-    let mut p = vec![text_profile(), image_profile_v1()];
-    p.extend(experimental_profiles());
-    p
+    registry().to_vec()
+}
+
+fn registry() -> &'static [Profile] {
+    // Manifests are immutable build constants. Construct and hash them once,
+    // rather than once per verified vector during exhaustive comparison.
+    static PROFILES: OnceLock<Vec<Profile>> = OnceLock::new();
+    PROFILES.get_or_init(|| {
+        let mut p = vec![
+            text_profile(),
+            image_profile_v1(),
+            image_profile_v2(),
+            video_profile_v1(),
+        ];
+        p.extend(experimental_profiles());
+        for backend in [Backend::Coreml, Backend::Cuda] {
+            p.push(accelerated(image_profile_v2(), backend));
+            p.push(accelerated(video_profile_v1(), backend));
+        }
+        p
+    })
 }
 
 pub fn find(id: &str) -> crate::Result<Profile> {
-    profiles()
-        .into_iter()
+    registry()
+        .iter()
         .find(|p| p.profile_id == id)
+        .cloned()
         .ok_or_else(|| {
             crate::Error::new(
                 crate::ErrorCode::UnknownProfile,

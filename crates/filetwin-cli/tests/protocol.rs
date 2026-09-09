@@ -85,6 +85,61 @@ fn help_capabilities_and_errors_do_not_require_an_index() {
 }
 
 #[test]
+fn explicit_backend_selects_frozen_profiles_and_runtime_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("input.txt");
+    fs::write(
+        &source,
+        "Backend selection does not require models for text.",
+    )
+    .unwrap();
+    for backend in ["cpu", "reference", "coreml", "cuda"] {
+        let data = temp.path().join(backend);
+        let (code, summary) = json_output(
+            &data,
+            &[
+                "index",
+                source.to_str().unwrap(),
+                "--experimental",
+                "--backend",
+                backend,
+                "--inference-threads",
+                "3",
+            ],
+        );
+        assert_eq!(code, 0, "{summary}");
+        let profiles = summary["data"]["scope_summary"]["profiles"]
+            .as_array()
+            .unwrap();
+        let image = profiles.iter().find(|p| p["family"] == "image").unwrap();
+        let selected =
+            filetwin_core::profile::inference_backend(image["profile_id"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(selected.as_str(), backend);
+        let (code, doctor) = json_output(
+            &data,
+            &[
+                "doctor",
+                "--inference-threads",
+                "3",
+                "--cuda-device-id",
+                "2",
+            ],
+        );
+        assert_eq!(code, 0);
+        assert_eq!(doctor["data"]["runtime"]["inference_threads"], 3);
+        assert_eq!(doctor["data"]["runtime"]["cuda_device_id"], 2);
+    }
+    let missing = temp.path().join("invalid");
+    let (code, _) = json_output(
+        &missing,
+        &["index", source.to_str().unwrap(), "--backend", "cuda"],
+    );
+    assert_eq!(code, 2);
+    assert!(!missing.exists());
+}
+
+#[test]
 fn score_matrix_filter_and_group_commands_share_saved_evidence() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");

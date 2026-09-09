@@ -10,7 +10,7 @@ license-file.workspace = true
 [dependencies]
 filetwin-core = { path = "../filetwin-core" }
 image = { version = "=0.25.10", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-27"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-27", "coreml", "cuda"] }
 pdfium-render = { version = "=0.9.4", default-features = false, features = ["pdfium_7881"] }
 quick-xml = "=0.42.0"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
@@ -20,6 +20,7 @@ serde_json.workspace = true
 sha2.workspace = true
 libc.workspace = true
 tempfile.workspace = true
+fs2.workspace = true
 
 [lints]
 workspace = true

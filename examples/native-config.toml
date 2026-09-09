@@ -7,6 +7,9 @@ temp_dir = "../.filetwin/tmp"
 
 [engine.runtime]
 worker_path = "../target/release/filetwin-worker"
+inference_threads = 2
+cuda_device_id = 0
+# cuda_library_dirs = ["/usr/local/cuda/lib64", "/absolute/path/to/cudnn/lib"]
 # CLI resolves FFmpeg and ffprobe from PATH if omitted.
 # ffmpeg_path = "/opt/homebrew/bin/ffmpeg"
 # ffprobe_path = "/opt/homebrew/bin/ffprobe"
@@ -17,3 +20,4 @@ worker_path = "../target/release/filetwin-worker"
 memory_bytes = 2147483648
 staging_bytes = 10737418240
 result_bytes = 1073741824
+inference_workers = 2

@@ -33,6 +33,12 @@ pub struct Cli {
     pub onnxruntime_path: Option<PathBuf>,
     #[arg(long, global = true)]
     pub pdfium_path: Option<PathBuf>,
+    #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..=64))]
+    pub inference_threads: Option<u32>,
+    #[arg(long, global = true, value_parser = clap::value_parser!(i32).range(0..))]
+    pub cuda_device_id: Option<i32>,
+    #[arg(long, global = true)]
+    pub cuda_library_dir: Vec<PathBuf>,
     #[arg(long, global = true, value_enum)]
     pub format: Option<Format>,
     #[arg(long, global = true)]
@@ -109,6 +115,9 @@ pub struct InputArgs {
     /// Select experimental encoders for all families, or those in --families.
     #[arg(long, conflicts_with_all = ["experimental_text", "profiles"])]
     pub experimental: bool,
+    /// Select image/video inference profiles; reference preserves the old CPU results.
+    #[arg(long, requires = "experimental", value_parser = ["cpu", "reference", "coreml", "cuda"])]
+    pub backend: Option<String>,
     #[arg(long = "profile", value_name = "FAMILY=PROFILE_ID")]
     pub profiles: Vec<String>,
     #[arg(long, value_delimiter = ',')]

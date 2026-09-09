@@ -7,7 +7,10 @@ use std::io::{Read, Write};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = Vec::new();
     std::io::stdin().read_to_end(&mut bytes)?;
-    let request: Request = serde_json::from_slice(&bytes)?;
+    let mut request: Request = serde_json::from_slice(&bytes)?;
+    if request.profile_id.is_empty() {
+        request.profile_id = filetwin_core::profile::image_profile_v2().profile_id;
+    }
     let (rgb, _) = raster::read_rgb(&request)?;
     let tensor = raster::preprocess(&rgb);
     let vector = raster::Sscd::load(&request)?.tensor(tensor.clone())?;

@@ -120,6 +120,20 @@ impl Configuration {
         )
         .unwrap_or_else(|| data_dir.join("tmp"));
         let mut runtime = file.engine.runtime;
+        runtime.inference_threads = cli.inference_threads.unwrap_or(runtime.inference_threads);
+        runtime.cuda_device_id = cli.cuda_device_id.unwrap_or(runtime.cuda_device_id);
+        runtime.cuda_library_dirs = if cli.cuda_library_dir.is_empty() {
+            runtime
+                .cuda_library_dirs
+                .iter()
+                .map(|p| absolute(p, &base))
+                .collect()
+        } else {
+            cli.cuda_library_dir
+                .iter()
+                .map(|p| absolute(p, &cwd))
+                .collect()
+        };
         for (configured, flag) in [
             (&mut runtime.worker_path, &cli.worker_path),
             (&mut runtime.ffmpeg_path, &cli.ffmpeg_path),
@@ -205,7 +219,9 @@ impl Configuration {
                 overrides["profiles"] = json!({"text":profile::text_profile().profile_id});
                 overrides["families"] = json!(["text"]);
             } else if input.experimental {
-                let selected: Map<String, Value> = profile::experimental_profiles()
+                let backend =
+                    serde_json::from_value(json!(input.backend.as_deref().unwrap_or("cpu")))?;
+                let selected: Map<String, Value> = profile::experimental_profiles_for(backend)
                     .into_iter()
                     .filter(|p| {
                         input
