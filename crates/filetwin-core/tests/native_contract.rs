@@ -119,6 +119,49 @@ fn mixed_dimensions_profiles_cache_and_frozen_comparison() {
 }
 
 #[test]
+fn matrices_keep_incompatible_profiles_null_even_when_dimensions_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    response(&root.join("image.json"), "image", 512);
+    response(&root.join("video.json"), "video", 512);
+    let cfg = config(
+        &root,
+        &format!(
+            "request=$(/bin/cat)\ncase \"$request\" in *'\"format\":\"media\"'*) /bin/cat '{}' ;; *) /bin/cat '{}' ;; esac",
+            root.join("video.json").display(),
+            root.join("image.json").display()
+        ),
+    );
+    let input = root.join("input");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("image.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    fs::write(input.join("video.mp4"), b"\0\0\0\x18ftypisom").unwrap();
+    let engine = Engine::open(cfg, HostServices::default()).unwrap();
+    let summary = engine
+        .submit(JobRequest::experimental_scores([input]))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(summary.counts.files_ready, 2, "{summary:?}");
+    let matrix = Catalog::open_read_only(root.join("data"))
+        .unwrap()
+        .matrix(MatrixQuery::new(summary.run_id.unwrap()))
+        .unwrap();
+    assert_eq!(
+        matrix.scores,
+        vec![vec![Some(1.0), None], vec![None, Some(1.0)]]
+    );
+    assert_eq!(
+        matrix.unavailable_reasons[0][1],
+        Some(MatrixUnavailable::IncompatibleProfile)
+    );
+    assert_eq!(
+        matrix.unavailable_reasons[1][0],
+        Some(MatrixUnavailable::IncompatibleProfile)
+    );
+}
+
+#[test]
 fn malformed_worker_output_is_a_file_failure_and_does_not_stop_text() {
     let temp = tempfile::tempdir().unwrap();
     let tmp = temp.path().canonicalize().unwrap();

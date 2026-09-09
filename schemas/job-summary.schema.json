@@ -89,6 +89,18 @@
           "minimum": 0,
           "type": "integer"
         },
+        "scores_retained": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scores_reused": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "similar_pairs": {
           "format": "uint64",
           "minimum": 0,

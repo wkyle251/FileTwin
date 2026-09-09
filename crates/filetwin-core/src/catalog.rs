@@ -14,7 +14,7 @@ use std::{
 /// Read-only catalog connections are Send, but not Sync. Open a separate catalog
 /// on each querying thread. Queries never migrate or initialize an index.
 pub struct Catalog {
-    db: Connection,
+    pub(crate) db: Connection,
     directory: PathBuf,
 }
 struct Target {
@@ -34,6 +34,8 @@ struct Cursor {
     group: Option<String>,
     file: Option<String>,
     last: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_score: Option<f64>,
 }
 
 impl Catalog {
@@ -46,6 +48,14 @@ impl Catalog {
             .0
             .profiles
             .unwrap_or_default())
+    }
+
+    pub fn score_run_profiles(
+        &self,
+        run_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        let source = store::score_run(&self.db, run_id, None)?;
+        self.snapshot_profiles(&source.snapshot)
     }
 
     pub fn open_read_only(directory: impl AsRef<Path>) -> Result<Self> {
@@ -162,6 +172,7 @@ impl Catalog {
             "groups",
             "members",
             "pairs",
+            "scores",
             "files",
             "locations",
             "errors",
@@ -185,6 +196,13 @@ impl Catalog {
         }
         if query.kind == "summary" && (query.cursor.is_some() || query.page_size.is_some()) {
             return Err(Error::invalid("summary rejects cursor and page_size"));
+        }
+        if let Some(score) = query.min_score
+            && (query.kind != "scores" || !score.is_finite() || !(-1.0..=1.0).contains(&score))
+        {
+            return Err(Error::invalid(
+                "min_score is a finite cutoff in [-1, 1] for scores queries only",
+            ));
         }
         let size = query.page_size.unwrap_or(100);
         if !(1..=1000).contains(&size) {
@@ -225,13 +243,21 @@ impl Catalog {
                 || c.revision != target.revision
                 || c.kind != query.kind
                 || c.group != query.group_id
-                || c.file != query.file_id)
+                || c.file != query.file_id
+                || c.min_score != query.min_score)
         {
             return Err(Error::new(
                 ErrorCode::InvalidCursor,
                 "results",
                 "Cursor belongs to another query or revision",
             ));
+        }
+        if query.kind == "scores" {
+            store::score_run(
+                &self.db,
+                target.run.as_deref().expect("Run query"),
+                Some(target.revision),
+            )?;
         }
         if let Some(gid) = &query.group_id {
             let exists:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM records WHERE owner=?1 AND revision=?2 AND kind='groups' AND key=?3)",params![target.owner,target.revision,gid],|r|r.get(0))?;
@@ -260,14 +286,15 @@ impl Catalog {
         let (owner, revision) = record_owner(&target, &query.kind);
         let filter = query.group_id.as_ref().or(query.file_id.as_ref());
         let after = cursor.as_ref().map(|c| c.last.as_str()).unwrap_or("");
-        let mut stmt=self.db.prepare("SELECT key,payload FROM records WHERE owner=?1 AND revision=?2 AND kind=?3 AND (?4 IS NULL OR filter_id=?4) AND key>?5 ORDER BY key LIMIT ?6")?;
+        let mut stmt=self.db.prepare("SELECT key,payload FROM records WHERE owner=?1 AND revision=?2 AND kind=?3 AND (?4 IS NULL OR filter_id=?4) AND key>?5 AND (?7 IS NULL OR json_extract(payload,'$.score')>=?7) ORDER BY key LIMIT ?6")?;
         let mut rows = stmt.query(params![
             owner,
             revision,
             query.kind,
             filter,
             after,
-            size + 1
+            size + 1,
+            query.min_score
         ])?;
         let (mut items, mut bytes, mut last, mut more) = (Vec::new(), 0usize, String::new(), false);
         while let Some(row) = rows.next()? {
@@ -301,6 +328,7 @@ impl Catalog {
                 group: query.group_id,
                 file: query.file_id,
                 last,
+                min_score: query.min_score,
             })?))
         } else {
             None
@@ -346,7 +374,7 @@ impl Catalog {
         let stage = tempfile::Builder::new()
             .prefix(".filetwin-export-")
             .tempdir_in(parent)?;
-        let kinds: Vec<&str> = if target.run.is_some() {
+        let mut kinds: Vec<&str> = if target.run.is_some() {
             vec![
                 "summary",
                 "groups",
@@ -359,6 +387,16 @@ impl Catalog {
         } else {
             vec!["files", "locations", "errors"]
         };
+        if let Some(run) = &target.run {
+            let raw: String = self.db.query_row(
+                "SELECT j.request FROM jobs j JOIN runs r ON r.job_id=j.id WHERE r.id=?1",
+                [run],
+                |r| r.get(0),
+            )?;
+            if serde_json::from_str::<JobRequest>(&raw)?.retains_scores() {
+                kinds.push("scores");
+            }
+        }
         let mut artifacts = Vec::new();
         for kind in kinds {
             if cancel() {
@@ -533,7 +571,7 @@ fn csv_columns(kind: &str) -> Vec<&'static str> {
             "threshold",
             "representative_file_id",
         ],
-        "pairs" => vec![
+        "pairs" | "scores" => vec![
             "file_a",
             "file_b",
             "match_kind",
@@ -585,11 +623,12 @@ pub fn capabilities() -> Value {
             "file_deadline_seconds":crate::worker_protocol::MAX_FILE_SECONDS,"source_access":"bounded private staging from an opened no-follow source",
             "staging":"one full source file plus 2 MiB protocol reserve","memory":"bounded buffers/admission; Linux worker address-space limit; macOS has no hard RSS limit"},
         "scorer":"filetwin_cosine_f64_v1","sqlite_version":rusqlite::version(),"strict_consistency_available":false,"docker_required":false,
-        "limitations":["Experimental, uncalibrated profiles; explicit thresholds required","Local macOS/Linux files only",
+        "score_outputs":{"retention_modes":["matches","all"],"group_from_saved_scores":true,"matrix_default_axis_limit":128,"matrix_max_axis_limit":256,"matrix_max_response_bytes":MAX_PAGE_BYTES,"null_scores_have_reasons":true},
+        "limitations":["Experimental, uncalibrated profiles; explicit thresholds required for grouping, optional for all-scores mode","Local macOS/Linux files only",
             "OCR, legacy Office, slides/spreadsheets, generic archives and SVG rendering are not implemented",
             "PQ/HLG HDR HEIF/AVIF and video require a separate tone-mapping profile; auxiliary HEIF depth/alpha items are not composed",
             "Document text excludes layout and auxiliary DOCX parts; blank/scanned PDF pages require separate handling",
             "Audio/video use bounded timeline samples; video ignores sound and temporal order",
-            "Scalar reference matching; no BLAS or pair-score reuse","Result budget counts records, not total managed disk storage",
+            "Scalar reference matching; no BLAS or incremental score reuse across snapshots; group reuses a saved score run","Result budget counts records, not total managed disk storage",
             "Sidecars, maintenance, and 10 TB qualification remain later milestones"]})
 }

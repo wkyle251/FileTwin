@@ -1,7 +1,18 @@
 # FileTwin implementation plan
 
 Date: 2026-09-09
-Status: milestone 1 and the all-family encoding implementation complete; qualification/maintenance remain planned
+Status: milestone 1, all-family encoding, and saved-score/matrix implementation complete; qualification/maintenance remain planned
+
+## Saved scores, matrices, and later grouping
+
+- [x] Add explicit full-score retention with optional grouping and no mandatory cutoff in score-only mode; preserve the existing threshold workflow.
+- [x] Persist unique compatible pair scores independently of threshold decisions; publish score pages and JSON/JSONL/CSV artifacts.
+- [x] Add bounded matrix pages with stable axes, immutable revision selection, real zero/negative scores, null reasons, and coverage.
+- [x] Filter score queries by a cursor-bound minimum score; group an exhaustive saved revision without reading vectors or originals.
+- [x] Preserve conservative all-pairs groups, separate SHA-256 evidence, original pair scope, source failures, result allowances, and cancellation/resume checkpoints.
+- [x] Upgrade schema v1 transactionally to v2 for grouping cursors; preserve old IDs, vectors, snapshots and results, and allow read-only v1 queries.
+- [x] Document CLI parameters, JSON requests and responses, matrix paging, storage limits, and runnable Rust integration in the README; generate the additional matrix schemas.
+- [x] Finish regression checks and release CLI verification: 49 tests, Clippy, formatting, 11 generated schemas, schema-validated CLI workflows, legacy exports, and the runnable Rust score/matrix example passed locally.
 
 ## Current implementation: all four encoding families
 
@@ -28,7 +39,7 @@ and the differences from the target architecture are explicit.
   contracts; reject unknown fields, duplicate JSON keys, and invalid combinations.
 - [x] Freeze a reproducible experimental 4,096-dimensional text profile with
   streaming UTF-8/BOM/newline/NFC handling and bounded normalization state.
-  Require explicit experimental profile selection and a comparison threshold;
+  Require explicit experimental profile selection and thresholds when grouping;
   do not claim a calibrated production default.
 - [x] Implement local regular-file discovery, no-follow access, hard-link and
   overlapping-root handling, filters, per-file outcomes, and stable locators.
@@ -49,7 +60,7 @@ and the differences from the target architecture are explicit.
   build, then exercise the release executable on a sample collection.
 
 The preview uses the portable reference scorer first. Native BLAS acceleration,
-parallel extraction tuning, and reuse of unchanged pair scores follow correctness
+parallel extraction tuning, and incremental score reuse across snapshots follow correctness
 qualification; no section 9 throughput figures apply to this implementation.
 Strict source snapshots, sidecar trust/import/export, cloud providers, and
 unsupported readers must return explicit unsupported/capability outcomes rather
@@ -113,7 +124,8 @@ with `scripts/setup-format-fixtures.py` and `scripts/format-smoke.py`; this run'
 local artifact is `target/format-audit/format-results.json`. No Linux runtime,
 full codec-variant, or accuracy qualification is inferred from this Mac run.
 
-Completed locally on 2026-09-08, macOS 26.6.1 / ARM64, Rust 1.98.1:
+Earlier baseline, completed locally on 2026-09-08, macOS 26.6.1 / ARM64, Rust 1.98.1
+(the saved-score validation above records the newer checks):
 
 | Check | Result |
 | --- | --- |
@@ -121,8 +133,8 @@ Completed locally on 2026-09-08, macOS 26.6.1 / ARM64, Rust 1.98.1:
 | `cargo clippy --locked --workspace --all-targets -- -D warnings` | Passed |
 | `cargo test --locked --workspace` | 37 tests passed: 3 text, 18 core integration, 5 native-boundary/cache, 8 CLI subprocess and 3 extractor tests |
 | `cargo check --locked -p filetwin-core --no-default-features` | Passed with the host's system SQLite linkage |
-| Generated-schema freshness check | All 9 schemas match the Rust contracts |
-| JSON Schema Draft 2020-12 validation | All 9 schemas valid; actual release CLI envelopes, summaries, pages, accepted requests and profile validate |
+| Generated-schema freshness check | All 9 baseline schemas match the Rust contracts |
+| JSON Schema Draft 2020-12 validation | All 9 baseline schemas valid; actual release CLI envelopes, summaries, pages, accepted requests and profile validate |
 | `cargo build --locked --release --workspace --bins --examples` | Passed; `target/release/filetwin` and `target/release/filetwin-worker` |
 | Release smoke workflow | 3 ready files, 1 similar pair, 1 group; rescan has 3 cache hits / 0 bytes read; compare after deleting disposable originals has the same match / 0 bytes read |
 | JSON/JSONL/CSV exports | All 7 artifacts per run exported; record counts and SHA-256 checksums verified |

@@ -23,6 +23,13 @@
     "kind": {
       "type": "string"
     },
+    "min_score": {
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
     "page_size": {
       "format": "uint32",
       "minimum": 0,

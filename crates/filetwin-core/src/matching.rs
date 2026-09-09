@@ -91,14 +91,25 @@ pub(crate) fn compare(work: &mut Work<'_>) -> Result<()> {
                     && left.payload["profile_id"] == right.payload["profile_id"]
                 {
                     let profile_id = left.payload["profile_id"].as_str().expect("Ready profile");
-                    let threshold = work.job.request.threshold(profile_id)?;
+                    let threshold = work
+                        .job
+                        .request
+                        .matching
+                        .as_ref()
+                        .filter(|m| m.needs_thresholds())
+                        .map(|_| work.job.request.threshold(profile_id))
+                        .transpose()?;
                     let score = if left.vector_id == right.vector_id {
                         1.0
                     } else {
                         profile::cosine(a, &scan::verify_vector(&work.db, right_id)?)
                     };
                     compared = 1;
-                    if score >= threshold {
+                    if work.job.request.retains_scores() {
+                        pair_records.push(("similarity_score", Some(score),
+                            json!({"file_a":left.file_id,"file_b":right.file_id,"vector_a":left.vector_id,"vector_b":right.vector_id,"match_kind":"similarity_score","family":left.payload["family"],"profile_id":profile_id,"metric":"cosine","scorer":"filetwin_cosine_f64_v1","score":score,"calibration_status":"uncalibrated"})));
+                    }
+                    if threshold.is_some_and(|t| score >= t) {
                         let value = json!({"file_a":left.file_id,"file_b":right.file_id,"vector_a":left.vector_id,"vector_b":right.vector_id,"match_kind":"similar_content","family":left.payload["family"],"profile_id":profile_id,"metric":"cosine","score":score,"threshold":threshold,"calibration_status":"uncalibrated"});
                         pair_records.push(("similar_content", Some(score), value));
                     }
@@ -120,7 +131,9 @@ pub(crate) fn compare(work: &mut Work<'_>) -> Result<()> {
                 }
                 work.job.counts.pairs_compared += compared;
                 for (kind, score, value) in pair_records {
-                    if kind == "similar_content" {
+                    if kind == "similarity_score" {
+                        work.job.counts.scores_retained += 1;
+                    } else if kind == "similar_content" {
                         work.job.counts.similar_pairs += 1;
                     } else {
                         work.job.counts.exact_pairs += 1;
@@ -149,6 +162,116 @@ pub(crate) fn compare(work: &mut Work<'_>) -> Result<()> {
         work.checkpoint()?;
         if let Some(e) = stop {
             return Err(e);
+        }
+    }
+    work.job.stage = if work
+        .job
+        .request
+        .matching
+        .as_ref()
+        .is_some_and(|m| m.grouping == "none")
+    {
+        "scored"
+    } else {
+        "grouping"
+    }
+    .into();
+    work.checkpoint()
+}
+
+/// Filter immutable score records without loading vectors, models, or originals.
+/// Records, counters, budget consumption and the key cursor commit together.
+pub(crate) fn filter_scores(work: &mut Work<'_>) -> Result<()> {
+    let source = store::score_run(
+        &work.db,
+        work.job
+            .request
+            .source_run_id
+            .as_deref()
+            .expect("Score run"),
+        work.job.request.source_revision,
+    )?;
+    let source_run = work.job.request.source_run_id.clone().expect("Score run");
+    let run = work.job.run.clone().expect("Group run");
+    work.job.counts.files_discovered = source.summary.counts.files_discovered;
+    work.job.counts.files_ready = source.summary.counts.files_ready;
+    work.job.counts.files_failed = source.summary.counts.files_failed;
+    work.job.counts.files_excluded = source.summary.counts.files_excluded;
+    work.job.counts.locations = source.summary.counts.locations;
+    work.job.stage = "filtering".into();
+    loop {
+        work.check()?;
+        let rows = {
+            let mut stmt = work.db.prepare("SELECT key,payload FROM records WHERE owner=?1 AND revision=?2 AND kind='scores' AND key>?3 UNION ALL SELECT key,payload FROM records WHERE owner=?1 AND revision=?2 AND kind='pairs' AND key>?3 AND json_extract(payload,'$.match_kind')='byte_identical' ORDER BY key LIMIT 64")?;
+            stmt.query_map(
+                params![source_run, source.revision, work.job.score_cursor],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let mut pending = Vec::new();
+        let mut stop = None;
+        for (key, raw) in rows {
+            if let Err(error) = work.check() {
+                stop = Some(error);
+                break;
+            }
+            let mut value: Value = serde_json::from_str(&raw)?;
+            let scored = value["match_kind"] == "similarity_score";
+            let keep = if scored {
+                let score = value["score"]
+                    .as_f64()
+                    .filter(|score| score.is_finite() && (-1.0..=1.0).contains(score))
+                    .ok_or_else(|| {
+                        crate::Error::new(
+                            crate::ErrorCode::DatabaseCorrupt,
+                            "scores",
+                            "Saved score is missing or is not a finite cosine value",
+                        )
+                    })?;
+                let threshold = work.job.request.threshold(
+                    value["profile_id"]
+                        .as_str()
+                        .ok_or_else(|| crate::Error::invalid("Saved score has no profile"))?,
+                )?;
+                value["match_kind"] = json!("similar_content");
+                value["threshold"] = json!(threshold);
+                score >= threshold
+            } else {
+                true
+            };
+            if keep {
+                let payload = serde_json::to_string(&value)?;
+                if let Err(error) = work.charge(payload.len() as u64) {
+                    stop = Some(error);
+                    break;
+                }
+                if scored {
+                    work.job.counts.similar_pairs += 1;
+                } else {
+                    work.job.counts.exact_pairs += 1;
+                }
+                pending.push((value, payload));
+            }
+            if scored {
+                work.job.counts.scores_reused += 1;
+            }
+            work.job.score_cursor = key;
+        }
+        let tx = work.db.unchecked_transaction()?;
+        for (value, payload) in pending {
+            tx.execute("INSERT OR IGNORE INTO work_pairs(run_id,a,b,kind,score,payload) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![run,value["file_a"].as_str(),value["file_b"].as_str(),value["match_kind"].as_str(),value["score"].as_f64(),payload])?;
+        }
+        work.job.elapsed = work.elapsed();
+        store::save_job(&tx, &work.job)?;
+        tx.commit()?;
+        work.checkpoint()?;
+        if let Some(error) = stop {
+            return Err(error);
         }
     }
     work.job.stage = "grouping".into();
@@ -220,7 +343,7 @@ pub(crate) fn publish(work: &Work<'_>, summary: &JobSummary) -> Result<()> {
         "INSERT INTO publications(run_id,revision,summary) VALUES(?1,?2,?3)",
         params![run, revision, serde_json::to_string(summary)?],
     )?;
-    tx.execute("INSERT INTO records(owner,revision,kind,key,filter_id,payload) SELECT run_id,?2,'pairs',a||'/'||b||'/'||kind,NULL,payload FROM work_pairs WHERE run_id=?1",params![run,revision])?;
+    tx.execute("INSERT INTO records(owner,revision,kind,key,filter_id,payload) SELECT run_id,?2,CASE WHEN kind='similarity_score' THEN 'scores' ELSE 'pairs' END,a||'/'||b||'/'||kind,NULL,payload FROM work_pairs WHERE run_id=?1",params![run,revision])?;
     if summary.status == "completed" {
         let mut stmt=tx.prepare("SELECT g.group_id,g.kind,g.minimum,count(m.file_id),min(m.file_id) FROM work_groups g JOIN work_members m ON m.run_id=g.run_id AND m.kind=g.kind AND m.group_id=g.group_id WHERE g.run_id=?1 GROUP BY g.group_id,g.kind,g.minimum HAVING count(m.file_id)>=2 ORDER BY g.kind,g.ordinal")?;
         let mut rows = stmt.query([run])?;
@@ -266,7 +389,7 @@ pub(crate) fn publish(work: &Work<'_>, summary: &JobSummary) -> Result<()> {
             }
         }
     }
-    if work.job.request.operation == Operation::Compare {
+    if work.job.request.operation.uses_saved_input() {
         tx.execute("INSERT INTO records(owner,revision,kind,key,filter_id,payload) SELECT ?1,?2,'errors','snapshot/'||key,NULL,payload FROM records WHERE owner=?3 AND revision=1 AND kind='errors'",params![run,revision,sid])?;
     }
     store::copy_errors(&tx, &work.job, run, revision)?;

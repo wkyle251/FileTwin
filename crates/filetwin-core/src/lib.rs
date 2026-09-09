@@ -10,6 +10,7 @@ mod engine;
 mod error;
 mod local;
 mod matching;
+mod matrix;
 mod native;
 pub mod profile;
 mod scan;

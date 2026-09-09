@@ -2,17 +2,19 @@
 
 FileTwin finds similar local text, documents, images, audio and video. It provides a native `filetwin`
 CLI, JSON/JSONL output for other applications, and the `filetwin-core` Rust
-library. It indexes content, saves immutable snapshots, and retains every
-qualifying pair alongside conservative groups.
+library. It indexes content, saves immutable snapshots, and can retain every
+compatible pairwise score for matrix output and later filtering/grouping.
 
 **Status: all four encoding families implemented, developer preview 0.1.0-dev.**
-Profiles remain experimental; thresholds are required and are not accuracy
-percentages. Unsupported formats and failed extraction produce explicit outcomes.
+Profiles remain experimental. `--all-scores` needs no cutoff; grouping requires
+explicit thresholds, which are not accuracy percentages. Unsupported formats
+and failed extraction produce explicit outcomes.
 OCR, cloud sources, calibration and production-scale qualification remain in the
 [implementation plan](implementation-plan.md).
 The [architecture](file-similarity-architecture.md) describes the broader target.
 See [Supported file formats](#supported-file-formats) for the current format list,
 runtime requirements and exclusions.
+For caller-controlled cutoffs, start with [scores and matrices](#calculate-scores-then-filter-or-group).
 
 **HEIC/AVIF are supported for standard dynamic range (SDR) images.** The remaining
 restriction concerns HDR variants using PQ/HLG. See [HEIC/AVIF support](#heicavif-support).
@@ -28,7 +30,7 @@ runtime service are needed for text processing.
 cargo build --locked --release -p filetwin-cli
 ./target/release/filetwin doctor --format json
 ./target/release/filetwin scan examples/text --data-dir .filetwin \
-  --experimental-text --threshold 0.7 --format human
+  --experimental-text --all-scores --format json
 ```
 
 For all four encoding families, build the companion worker and explicitly
@@ -49,7 +51,7 @@ python3 scripts/setup-native.py --model-dir .filetwin/models \
 
 ./target/release/filetwin --data-dir .filetwin doctor --format json
 ./target/release/filetwin --data-dir .filetwin scan /absolute/path/to/files \
-  --experimental --threshold 0.95 --format jsonl
+  --experimental --all-scores --format jsonl
 ```
 
 The native assets are installed under `.filetwin/models` by this command.
@@ -70,6 +72,197 @@ thresholds when appropriate:
 
 These cutoffs are user choices, not recommended calibrated values. For example,
 cosine `0.95` does not mean a 95% probability that two files are duplicates.
+
+## Calculate scores, then filter or group
+
+Use this workflow when a CLI caller or another application chooses the cutoff
+after seeing the scores. All paths below are local; scan data and reports should
+remain outside the source repository or in a Git-ignored directory.
+
+```sh
+# 1. Encode each file and save every compatible pairwise score; no cutoff needed.
+./target/release/filetwin --data-dir .filetwin scan /absolute/path/to/files \
+  --experimental --all-scores --exact-duplicates compute --format json
+
+# 2. Use the run_id returned in the summary to read a matrix.
+./target/release/filetwin --data-dir .filetwin matrix --run SCORE_RUN_ID \
+  --format json
+
+# 3. Filter saved pairs at any cutoff. This reads neither files nor vectors.
+./target/release/filetwin --data-dir .filetwin results --run SCORE_RUN_ID \
+  --kind scores --min-score 0.80 --page-size 100 --format json
+
+# 4. Optionally build conservative groups from the same saved scores.
+./target/release/filetwin --data-dir .filetwin group --run SCORE_RUN_ID \
+  --threshold 0.95 --format json
+./target/release/filetwin --data-dir .filetwin group --run SCORE_RUN_ID \
+  --threshold 0.80 --format json
+```
+
+`SCORE_RUN_ID` is an actual `run_id`, not a snapshot ID. The first command returns
+a summary, not the matrix itself. Each `group` command returns a **new** group
+run ID; use `results --run GROUP_RUN_ID --kind groups`, then `--kind members
+--group GROUP_ID` to read it. The saved score run remains unchanged.
+
+To score an existing snapshot, use
+`compare --snapshot SNAPSHOT_ID --all-scores`. This calculates scores from saved
+vectors without re-encoding or reading originals. After that, `results`, `matrix`
+and `group` reuse those scores. `compare` itself starts a fresh comparison; it
+does not reuse scores from earlier runs or other snapshots.
+
+The existing `scan --experimental --threshold 0.95` workflow still immediately
+filters and groups, retaining only qualifying pairs. Adding `--all-scores
+--threshold 0.95` both retains all scores and builds those initial groups.
+`--all-scores` without a threshold clears configured cutoff defaults and skips
+all grouping, including exact-duplicate grouping. SHA-256 evidence is still
+retained when requested and is available to a later `group` command.
+
+### Inputs and parameters
+
+| Input | CLI | Meaning |
+| --- | --- | --- |
+| Files/directories | `scan PATH… --experimental --all-scores` | Recursive input; all four current families selected. Native encoders need the setup above. |
+| Saved vectors | `compare --snapshot ID --all-scores` | Produce a new score run from an immutable snapshot. |
+| Matrix source | `matrix --run ID [--revision N]` | Read all retained scores as a rectangular matrix page. |
+| Matrix window | `--row-offset N --column-offset N --row-limit N --column-limit N` | Zero-based offsets; each limit defaults to 128 and must be 1–256. |
+| Filtered score page | `results --run ID --kind scores [--min-score S]` | Inclusive cosine cutoff in `[-1, 1]`; omit it to read every retained compatible pair. |
+| Score-page continuation | `--cursor TOKEN --page-size N [--revision N]` | Existing paging rules apply; keep the same `--min-score` when reusing a cursor. |
+| Group input | `group --run ID [--revision N] --threshold [FAMILY\|PROFILE_ID=]S` | Requires a completed, exhaustive score revision; the selected revision and original pair scope are frozen in the new job. |
+| Storage/time allowance | `--result-bytes N --max-runtime-seconds N` | Supported by scoring and grouping; an exhausted allowance produces explicit partial coverage. |
+
+For matrix windows, `rows` and `columns` follow the same immutable file-ID order.
+Keep the returned `result_revision` on subsequent requests. Both
+`next_row_offset` and `next_column_offset` are independent: fetch every column
+window for a row window, reset the column offset, then advance the row offset.
+The matrix page does not claim to include every file when either continuation offset is
+non-null. Each response has a 4 MiB ceiling; request a smaller window if needed.
+
+### Matrix and score outputs
+
+With `--format json`, stdout contains one versioned envelope. A matrix response
+has `type: "matrix"`. This **abridged illustrative response** shows the layout;
+full fields are defined in [matrix-page.schema.json](schemas/matrix-page.schema.json):
+
+```json
+{
+  "schema_version": 1,
+  "type": "matrix",
+  "data": {
+    "snapshot_id": "snapshot_example",
+    "run_id": "run_example",
+    "result_revision": 1,
+    "metric": "cosine",
+    "score_range": [-1.0, 1.0],
+    "total_files": 2,
+    "row_offset": 0,
+    "column_offset": 0,
+    "rows": [{"file_id": "file_a"}, {"file_id": "file_b"}],
+    "columns": [{"file_id": "file_a"}, {"file_id": "file_b"}],
+    "scores": [[1.0, 0.97], [0.97, 1.0]],
+    "unavailable_reasons": [[null, null], [null, null]],
+    "next_row_offset": null,
+    "next_column_offset": null
+  }
+}
+```
+
+Each full row/column record also contains `vector_id`, a lossless `locator`,
+`family`, `profile_id`, and processing `state`. `scores[i][j]` compares `rows[i]`
+with `columns[j]`. Scores retain full precision in `[-1, 1]`; multiply by 100
+only for display. Compare original scores against the cutoff, not rounded text.
+
+The matrix is symmetric. Self-similarity is 1 for files with valid vectors;
+ignore the diagonal when filtering duplicates. One row represents a file
+object; hard-link paths are available through the existing location queries.
+Byte-identical evidence remains separate from cosine scores, including for
+unsupported formats that have no vector.
+
+| Cell | Meaning |
+| --- | --- |
+| Number, including `0` or a negative score | A valid saved comparison. |
+| `null` / `file_unavailable` | At least one file has no usable vector; inspect its state and error records. Its diagonal is also null. |
+| `null` / `incompatible_profile` | Different families or encoding profiles cannot be compared, even when dimensions match. |
+| `null` / `outside_scope` | The requested pair scope excluded this pair. |
+| `null` / `not_computed` | The published score revision did not reach this pair. Inspect `completeness`; missing values are never treated as zero. |
+
+`results --kind scores` returns an ordinary `type: "page"` envelope. Each item
+contains `file_a`, `file_b`, `vector_a`, `vector_b`, `family`, `profile_id`,
+`metric`, `scorer`, `score`, `calibration_status`, and
+`match_kind: "similarity_score"`. These are measurements, not threshold decisions.
+Filtering does not change them. Score pages and exports store each unique
+non-self pair once, with `file_a < file_b`; the matrix supplies the mirrored view.
+For score pages, read `results --run ID --revision N --kind summary` to check
+coverage before interpreting missing pairs; completeness is carried directly
+in matrix responses.
+
+The scoring summary reports `counts.scores_retained` and `counts.pairs_compared`.
+A later grouping summary reports `counts.scores_reused`; its `pairs_compared`,
+`vectors_encoded`, and `bytes_read` are zero. Groups still guarantee that **every
+member pair** meets the chosen cutoff. Connected similarity chains are not
+automatically one group. Extraction failures remain visible in matrix cells,
+error queries, summaries, and group-run coverage.
+
+Full-score retention takes `N * (N - 1) / 2` records per compatible set, so it is
+an explicit option. At 10,000 compatible files that is 49,995,000 scores. Matrix
+windows and paginated score records bound response memory, not total storage.
+The default result allowance is 1 GiB of charged work records; database,
+publication, and export overhead add further disk use. Incomplete score runs
+remain queryable, but `group` requires exhaustive comparison coverage. An older
+threshold-only run must first be replaced by `compare --all-scores` over its
+snapshot; discarded scores cannot be recovered by a query.
+
+For a complete machine-readable export, use `export --run SCORE_RUN_ID
+--report-format jsonl --report-dir /absolute/path/to/new-report`. Score runs add
+`scores.jsonl` (or `.json`/`.csv`) to the normal report artifacts. Matrix output
+can be redirected to a file with `matrix ... --format json > matrix.json`.
+
+### JSON requests and Rust callers
+
+[score-scan-request.json](examples/score-scan-request.json) is a complete request
+for all four families. Set its absolute source path before running:
+
+```sh
+./target/release/filetwin --data-dir .filetwin run \
+  --request examples/score-scan-request.json --format json
+```
+
+Its `matching` input is:
+
+```json
+{"retrieval":"exact","score_retention":"all","grouping":"none"}
+```
+
+To group a saved run through JSON, submit `operation: "group"`,
+`source_run_id`, optional positive `source_revision`, and
+`matching.threshold_overrides` containing one cutoff per selected profile ID.
+For example, this request groups an **image-only** score run:
+
+```json
+{
+  "schema_version": 1,
+  "operation": "group",
+  "source_run_id": "run_example",
+  "source_revision": 1,
+  "matching": {
+    "threshold_overrides": {
+      "sha256:88a7383952aabd98b9bc41e66b355fc569e9070697040026e4476db04408700b": 0.8
+    }
+  }
+}
+```
+
+An all-family run needs all four cutoffs, including selected profiles with no
+ready files. The CLI's bare `--threshold 0.8` expands them automatically.
+`group` rejects discovery/encoding parameters and cannot expand or shrink the
+saved pair scope.
+
+Rust callers use `JobRequest::experimental_scores(paths)` (or
+`JobRequest::text_scores(paths)`), `Catalog::matrix(MatrixQuery::new(run_id))`,
+`Catalog::results(ResultsQuery { kind: "scores", min_score: Some(0.8), ... })`,
+and `JobRequest::group_scores(run_id, thresholds_by_profile_id)`.
+See the runnable [scores library example](crates/filetwin-core/examples/scores.rs),
+[matrix query schema](schemas/matrix-query.schema.json), and
+[processing request schema](schemas/job-request.schema.json).
 
 ## Supported file formats
 
@@ -192,7 +385,8 @@ punctuation edit. Use the returned IDs to inspect or export results:
 
 Replace `RUN_ID` and `GROUP_ID` with actual IDs. The export destination must be a
 new directory whose parent exists. Reports include files, locations, groups,
-members, pairs, errors, a summary, and a checksummed manifest. JSON, JSONL, and
+members, pairs, errors, a summary, and a checksummed manifest. Runs that retain
+all scores also export a `scores` artifact. JSON, JSONL, and
 CSV exports stream from persisted records. CSV includes `record_json` to retain
 the complete record, including nested and lossless path fields.
 
@@ -200,9 +394,11 @@ the complete record, including nested and lossless path fields.
 
 | Command | Input | Output |
 | --- | --- | --- |
-| `scan PATH…` | Files/directories, explicit profile, threshold | Job summary, immutable snapshot and comparison run |
+| `scan PATH…` | Files/directories, explicit profile, `--all-scores` and/or threshold | Job summary, immutable snapshot and comparison run |
 | `index PATH…` | Files/directories and explicit profile | Job summary and snapshot; no matching |
-| `compare --snapshot ID` | Saved snapshot and threshold | A new run without reading originals |
+| `compare --snapshot ID` | Saved snapshot, `--all-scores` and/or threshold | A new run without reading originals |
+| `matrix --run ID` | Score run/revision and row/column window | Matrix page with file axes, scores, null reasons, and coverage |
+| `group --run ID` | Exhaustive score run and new thresholds | New groups/pairs run; no vector comparison |
 | `run --request FILE` | Versioned JSON; `-` reads one request from stdin | Same pipeline as `scan`, `index`, or `compare` |
 | `resume --job ID` | Cancelled/interrupted job with unchanged settings | New attempt of the same job |
 | `status --job ID` | Existing job | Durable state, ownership, counts and resumability |
@@ -220,7 +416,8 @@ the complete record, including nested and lossless path fields.
 | `--experimental-text` | Keep the original UTF-8-only profile for compatibility |
 | `--families text,image,audio,video` | Restrict selected families; must match explicit profile selection |
 | `--profile FAMILY=PROFILE_ID` | Repeat to select exact IDs from `profiles list` |
-| `--threshold [FAMILY\|PROFILE_ID=]SCORE` | Required for every selected profile; finite cosine cutoff in `[-1, 1]` |
+| `--all-scores` | Retain all compatible scores; without `--threshold`, skip grouping |
+| `--threshold [FAMILY\|PROFILE_ID=]SCORE` | Required for every selected profile when filtering/grouping during a job; finite cosine cutoff in `[-1, 1]` |
 | `--pair-scope all_selected\|within_each_source` | Compare across selected roots, or only shared source memberships |
 | `--no-recursive` | Limit directory discovery to immediate files |
 | `--include GLOB`, `--exclude GLOB` | Root-relative, case-sensitive patterns; literals, `*`, `?`, `**`; exclusions win |
@@ -250,10 +447,10 @@ Staging is removed after success, error or cancellation. Native workers have a
 network content is fetched. Image/video admission requires 512 MiB; native
 document/audio admission requires 128 MiB. Large decoded frames can require more.
 Sidecar enable flags return `unsupported_capability`. `index` rejects matching
-parameters. `compare` accepts only memory, result, and time limits and uses the
+parameters. `compare` and `group` accept only memory, result, and time limits. `compare` uses the
 snapshot's original profile, scope memberships, digests, and extraction outcomes.
 
-`--kind` is one of `summary`, `groups`, `members`, `pairs`, `files`, `locations`,
+`--kind` is one of `summary`, `groups`, `members`, `pairs`, `scores`, `files`, `locations`,
 or `errors`. Members require `--group`; locations require `--file`. Snapshot
 queries support files, locations, and errors. Pages default to 100 records,
 at most 1,000, and have a 4 MiB serialized-record ceiling. Reuse `next_cursor`
@@ -367,7 +564,11 @@ The default data directory is `~/Library/Application Support/FileTwin` on macOS,
 or `$XDG_DATA_HOME/filetwin` (fallback `~/.local/share/filetwin`) on Linux. Keep
 the working index on a local filesystem. Only one processing engine can own a
 data directory. SQLite uses WAL, FULL synchronization, and foreign keys.
-Unknown/nonempty databases and incompatible schema versions are refused.
+Unknown/nonempty databases and newer schema versions are refused. Opening an
+existing FileTwin schema-v1 index with the engine upgrades it transactionally to
+schema v2, adding a grouping checkpoint cursor while preserving snapshots,
+vectors and results. Read-only queries can still inspect v1 indexes. Older
+FileTwin binaries cannot open an upgraded v2 index.
 
 Sources are opened without following the root entry or discovered symlinks.
 Aliases in the explicitly supplied root's **parent** are resolved once, allowing
@@ -392,8 +593,9 @@ require a new job; they cannot be increased through `resume`.
   explicit per-file outcomes. Image/audio/video encoders also produce one
   normalized vector each. No profile has passed the full accuracy qualification.
 - Matching is exhaustive using the portable reference cosine scorer. Pair
-  count grows quadratically; it has no BLAS acceleration or reuse of old pair
-  scores. This preview has **not** demonstrated 10 TB performance.
+  count grows quadratically; there is no BLAS acceleration or incremental score
+  reuse across snapshots. `group` and score queries reuse an existing score run.
+  This preview has **not** demonstrated 10 TB performance.
 - The memory setting governs admission and bounded internal buffers. Linux
   native workers also have an address-space limit; macOS has no hard RSS limit.
   Result allowance counts serialized inventory/pair work and

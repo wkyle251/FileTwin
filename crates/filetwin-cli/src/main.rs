@@ -146,6 +146,24 @@ fn execute(cli: &Cli, signals: &Signals, output: &mut Output) -> Result<i32> {
             Some(&args.snapshot),
             &request_id,
         )?),
+        Command::Group(args) => {
+            let matching = args::MatchingArgs {
+                all_scores: false,
+                threshold: args.threshold.clone(),
+                pair_scope: None,
+                retrieval: None,
+            };
+            let mut request = config.flag_request(
+                None,
+                Some(&matching),
+                Some(&args.limits),
+                "group",
+                Some(&args.run),
+                &request_id,
+            )?;
+            request.source_revision = args.revision;
+            Some(request)
+        }
         Command::Run { request } => {
             if cli.request_id.is_some() {
                 return Err(Error::invalid(
@@ -203,9 +221,27 @@ fn execute(cli: &Cli, signals: &Signals, output: &mut Output) -> Result<i32> {
                 result_revision: args.target.revision,
                 cursor: args.cursor.clone(),
                 page_size: args.page_size,
+                min_score: args.min_score,
             })?;
             output.run_id = page.run_id.clone();
             output.emit("page", json!(page))?;
+            Ok(0)
+        }
+        Command::Matrix(args) => {
+            let page = Catalog::open_read_only(config.engine.data_dir)?.matrix_with_cancel(
+                MatrixQuery {
+                    schema_version: 1,
+                    run_id: args.run.clone(),
+                    result_revision: args.revision,
+                    row_offset: args.row_offset,
+                    column_offset: args.column_offset,
+                    row_limit: args.row_limit,
+                    column_limit: args.column_limit,
+                },
+                &|| signals.cancelled(),
+            )?;
+            output.run_id = Some(page.run_id.clone());
+            output.emit("matrix", json!(page))?;
             Ok(0)
         }
         Command::Export(args) => {

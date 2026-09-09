@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 
-pub(crate) const DB_VERSION: i64 = 1;
+pub(crate) const DB_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x4654574e;
 
 pub(crate) fn now() -> String {
@@ -56,6 +56,11 @@ pub(crate) fn open_writer(dir: &Path) -> Result<Connection> {
             [id("index")],
         )?;
         tx.commit()?;
+    } else if version == 1 {
+        let tx = db.unchecked_transaction()?;
+        tx.execute_batch("ALTER TABLE jobs ADD COLUMN score_cursor TEXT NOT NULL DEFAULT '';")?;
+        tx.pragma_update(None, "user_version", DB_VERSION)?;
+        tx.commit()?;
     }
     let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
     let sync: i64 = db.pragma_query_value(None, "synchronous", |r| r.get(0))?;
@@ -92,7 +97,7 @@ pub(crate) fn open_reader(dir: &Path) -> Result<Connection> {
     db.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-8192;")?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let app: i64 = db.pragma_query_value(None, "application_id", |r| r.get(0))?;
-    if version != DB_VERSION || app != APPLICATION_ID {
+    if !(1..=DB_VERSION).contains(&version) || app != APPLICATION_ID {
         return Err(Error::new(
             ErrorCode::DatabaseVersionUnsupported,
             "storage",
@@ -125,6 +130,7 @@ pub(crate) struct Job {
     pub run: Option<String>,
     pub next_a: i64,
     pub next_b: i64,
+    pub score_cursor: String,
     pub source_partial: bool,
 }
 
@@ -143,6 +149,7 @@ pub(crate) fn insert_job(db: &Connection, request: JobRequest) -> Result<Job> {
         run: None,
         next_a: 1,
         next_b: 1,
+        score_cursor: String::new(),
         source_partial: false,
     };
     db.execute("INSERT INTO jobs(id,request,attempt,status,stage,started_at,updated_at,elapsed,used,counts,next_a,next_b,source_partial) VALUES(?1,?2,1,'queued','discovery',?3,?3,0,0,?4,1,1,0)",params![job.id,serde_json::to_string(&job.request)?,job.started_at,serde_json::to_string(&job.counts)?])?;
@@ -150,7 +157,32 @@ pub(crate) fn insert_job(db: &Connection, request: JobRequest) -> Result<Job> {
 }
 
 pub(crate) fn load_job(db: &Connection, id: &str) -> Result<Job> {
-    let row=db.query_row("SELECT request,attempt,status,stage,started_at,elapsed,used,counts,snapshot_id,run_id,next_a,next_b,source_partial FROM jobs WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,f64>(5)?,r.get::<_,u64>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?,r.get::<_,i64>(10)?,r.get::<_,i64>(11)?,r.get::<_,bool>(12)?))).optional()?.ok_or_else(||Error::new(ErrorCode::NotFound,"status","Unknown job ID"))?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let cursor = if version >= 2 { "score_cursor" } else { "''" };
+    let sql = format!(
+        "SELECT request,attempt,status,stage,started_at,elapsed,used,counts,snapshot_id,run_id,next_a,next_b,source_partial,{cursor} FROM jobs WHERE id=?1"
+    );
+    let row = db
+        .query_row(&sql, [id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, f64>(5)?,
+                r.get::<_, u64>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)?,
+                r.get::<_, i64>(11)?,
+                r.get::<_, bool>(12)?,
+                r.get::<_, String>(13)?,
+            ))
+        })
+        .optional()?
+        .ok_or_else(|| Error::new(ErrorCode::NotFound, "status", "Unknown job ID"))?;
     Ok(Job {
         id: id.into(),
         request: serde_json::from_str(&row.0)?,
@@ -166,11 +198,12 @@ pub(crate) fn load_job(db: &Connection, id: &str) -> Result<Job> {
         next_a: row.10,
         next_b: row.11,
         source_partial: row.12,
+        score_cursor: row.13,
     })
 }
 
 pub(crate) fn save_job(db: &Connection, job: &Job) -> Result<()> {
-    db.execute("UPDATE jobs SET attempt=?2,status=?3,stage=?4,updated_at=?5,elapsed=?6,used=?7,counts=?8,snapshot_id=?9,run_id=?10,next_a=?11,next_b=?12,source_partial=?13 WHERE id=?1",params![job.id,job.attempt,job.status,job.stage,now(),job.elapsed,job.used,serde_json::to_string(&job.counts)?,job.snapshot,job.run,job.next_a,job.next_b,job.source_partial])?;
+    db.execute("UPDATE jobs SET attempt=?2,status=?3,stage=?4,updated_at=?5,elapsed=?6,used=?7,counts=?8,snapshot_id=?9,run_id=?10,next_a=?11,next_b=?12,source_partial=?13,score_cursor=?14 WHERE id=?1",params![job.id,job.attempt,job.status,job.stage,now(),job.elapsed,job.used,serde_json::to_string(&job.counts)?,job.snapshot,job.run,job.next_a,job.next_b,job.source_partial,job.score_cursor])?;
     Ok(())
 }
 
@@ -328,13 +361,77 @@ pub(crate) fn create_run(db: &Connection, job: &mut Job) -> Result<()> {
     save_job(db, job)
 }
 
+pub(crate) struct ScoreRun {
+    pub snapshot: String,
+    pub revision: u64,
+    pub request: JobRequest,
+    pub summary: JobSummary,
+}
+
+/// Resolve a published, immutable score revision. Old threshold-only runs cannot
+/// supply scores that they discarded, even when their cutoff happened to be -1.
+pub(crate) fn score_run(db: &Connection, run: &str, revision: Option<u64>) -> Result<ScoreRun> {
+    let (snapshot, request): (String, String) = db
+        .query_row(
+            "SELECT r.snapshot_id,j.request FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.id=?1",
+            [run],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::new(ErrorCode::NotFound, "scores", "Unknown run ID"))?;
+    let request: JobRequest = serde_json::from_str(&request)?;
+    if !request.retains_scores() {
+        return Err(Error::new(
+            ErrorCode::UnsupportedCapability,
+            "scores",
+            "This run did not retain all scores; compare its snapshot with --all-scores first",
+        ));
+    }
+    let latest: Option<u64> = db.query_row(
+        "SELECT max(revision) FROM publications WHERE run_id=?1",
+        [run],
+        |r| r.get(0),
+    )?;
+    let latest = latest.ok_or_else(|| {
+        Error::new(
+            ErrorCode::ResultsNotReady,
+            "scores",
+            "Scores have not been published",
+        )
+    })?;
+    let revision = revision.unwrap_or(latest);
+    if revision == 0 {
+        return Err(Error::invalid("Score revision must be positive"));
+    }
+    let summary: String = db
+        .query_row(
+            "SELECT summary FROM publications WHERE run_id=?1 AND revision=?2",
+            params![run, revision],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::ResultExpired,
+                "scores",
+                "Requested score revision is unavailable",
+            )
+        })?;
+    Ok(ScoreRun {
+        snapshot,
+        revision,
+        request,
+        summary: serde_json::from_str(&summary)?,
+    })
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE profiles(id TEXT PRIMARY KEY,manifest TEXT NOT NULL);
 CREATE TABLE vectors(id TEXT PRIMARY KEY,profile_id TEXT NOT NULL REFERENCES profiles(id),payload BLOB NOT NULL,checksum TEXT NOT NULL);
 CREATE TABLE files(file_id TEXT PRIMARY KEY,revision TEXT NOT NULL,vector_id TEXT REFERENCES vectors(id),digest TEXT,payload TEXT NOT NULL);
 CREATE TABLE locations(location_id TEXT PRIMARY KEY,path BLOB NOT NULL,file_id TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE jobs(id TEXT PRIMARY KEY,request TEXT NOT NULL,attempt INTEGER NOT NULL,status TEXT NOT NULL,stage TEXT NOT NULL,started_at TEXT NOT NULL,updated_at TEXT NOT NULL,elapsed REAL NOT NULL,used INTEGER NOT NULL,counts TEXT NOT NULL,snapshot_id TEXT,run_id TEXT,next_a INTEGER NOT NULL,next_b INTEGER NOT NULL,source_partial INTEGER NOT NULL,summary TEXT);
+CREATE TABLE jobs(id TEXT PRIMARY KEY,request TEXT NOT NULL,attempt INTEGER NOT NULL,status TEXT NOT NULL,stage TEXT NOT NULL,started_at TEXT NOT NULL,updated_at TEXT NOT NULL,elapsed REAL NOT NULL,used INTEGER NOT NULL,counts TEXT NOT NULL,snapshot_id TEXT,run_id TEXT,next_a INTEGER NOT NULL,next_b INTEGER NOT NULL,source_partial INTEGER NOT NULL,summary TEXT,score_cursor TEXT NOT NULL DEFAULT '');
 CREATE TABLE job_files(job_id TEXT NOT NULL REFERENCES jobs(id),file_id TEXT NOT NULL,vector_id TEXT REFERENCES vectors(id),digest TEXT,payload TEXT NOT NULL,PRIMARY KEY(job_id,file_id));
 CREATE TABLE job_locations(job_id TEXT NOT NULL REFERENCES jobs(id),location_id TEXT NOT NULL,source_id TEXT NOT NULL,file_id TEXT NOT NULL,path BLOB NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(job_id,location_id,source_id));
 CREATE TABLE job_errors(id INTEGER PRIMARY KEY,job_id TEXT NOT NULL REFERENCES jobs(id),attempt INTEGER NOT NULL,payload TEXT NOT NULL);

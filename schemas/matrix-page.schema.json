@@ -1,0 +1,256 @@
+{
+  "$defs": {
+    "Completeness": {
+      "properties": {
+        "comparison_coverage": {
+          "type": "string"
+        },
+        "freshness": {
+          "type": "string"
+        },
+        "limits_reached": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "retrieval_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_coverage": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_coverage",
+        "comparison_coverage",
+        "limits_reached",
+        "freshness"
+      ],
+      "type": "object"
+    },
+    "MatrixFile": {
+      "properties": {
+        "family": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_id": {
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Source"
+        },
+        "profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "vector_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "file_id",
+        "locator",
+        "state"
+      ],
+      "type": "object"
+    },
+    "MatrixUnavailable": {
+      "enum": [
+        "file_unavailable",
+        "incompatible_profile",
+        "outside_scope",
+        "not_computed"
+      ],
+      "type": "string"
+    },
+    "RawPath": {
+      "additionalProperties": false,
+      "properties": {
+        "base64": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "encoding",
+        "base64"
+      ],
+      "type": "object"
+    },
+    "Source": {
+      "additionalProperties": false,
+      "properties": {
+        "connection_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local_path": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawPath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string"
+        },
+        "root": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "column_offset": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "columns": {
+      "items": {
+        "$ref": "#/$defs/MatrixFile"
+      },
+      "type": "array"
+    },
+    "completeness": {
+      "$ref": "#/$defs/Completeness"
+    },
+    "metric": {
+      "type": "string"
+    },
+    "next_column_offset": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "next_row_offset": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "result_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "row_offset": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "rows": {
+      "items": {
+        "$ref": "#/$defs/MatrixFile"
+      },
+      "type": "array"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "score_range": {
+      "items": {
+        "format": "double",
+        "type": "number"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "scores": {
+      "items": {
+        "items": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "type": "array"
+      },
+      "type": "array"
+    },
+    "snapshot_id": {
+      "type": "string"
+    },
+    "total_files": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unavailable_reasons": {
+      "items": {
+        "items": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MatrixUnavailable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": "array"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "snapshot_id",
+    "run_id",
+    "result_revision",
+    "metric",
+    "score_range",
+    "total_files",
+    "row_offset",
+    "column_offset",
+    "rows",
+    "columns",
+    "scores",
+    "unavailable_reasons",
+    "completeness"
+  ],
+  "title": "MatrixPage",
+  "type": "object"
+}

@@ -85,6 +85,87 @@ fn help_capabilities_and_errors_do_not_require_an_index() {
 }
 
 #[test]
+fn score_matrix_filter_and_group_commands_share_saved_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let input = tmp.path().join("input");
+    fs::create_dir(&input).unwrap();
+    for (name, text) in [("a", "aaa"), ("b", "aab"), ("c", "zzz")] {
+        fs::write(input.join(format!("{name}.txt")), text).unwrap();
+    }
+    let config = tmp.path().join("defaults.toml");
+    let profile = filetwin_core::profile::text_profile().profile_id;
+    fs::write(
+        &config,
+        format!("[defaults.matching.threshold_overrides]\n{profile:?} = 1.0\n"),
+    )
+    .unwrap();
+    let (code, scanned) = json_output(
+        &data,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "scan",
+            input.to_str().unwrap(),
+            "--experimental-text",
+            "--all-scores",
+        ],
+    );
+    assert_eq!(code, 0, "{scanned}");
+    assert_eq!(scanned["data"]["counts"]["scores_retained"], 3);
+    assert_eq!(scanned["data"]["counts"]["groups"], 0);
+    let run = scanned["data"]["run_id"].as_str().unwrap();
+    let (code, matrix) = json_output(&data, &["matrix", "--run", run]);
+    assert_eq!(code, 0, "{matrix}");
+    assert_eq!(matrix["type"], "matrix");
+    assert_eq!(matrix["data"]["rows"].as_array().unwrap().len(), 3);
+    let (code, filtered) = json_output(
+        &data,
+        &[
+            "results",
+            "--run",
+            run,
+            "--kind",
+            "scores",
+            "--min-score",
+            "-1",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(filtered["data"]["items"].as_array().unwrap().len(), 3);
+    fs::remove_dir_all(input).unwrap();
+    let (code, grouped) = json_output(&data, &["group", "--run", run, "--threshold", "text=-1"]);
+    assert_eq!(code, 0, "{grouped}");
+    assert_eq!(grouped["data"]["counts"]["scores_reused"], 3);
+    assert_eq!(grouped["data"]["counts"]["pairs_compared"], 0);
+    assert_eq!(grouped["data"]["counts"]["bytes_read"], 0);
+    assert_eq!(grouped["data"]["counts"]["groups"], 1);
+    let mut request =
+        JobRequest::group_scores(run, std::collections::BTreeMap::from([(profile, 0.95)]));
+    request.source_revision = Some(1);
+    let path = tmp.path().join("group.json");
+    fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
+    let (code, from_json) = json_output(&data, &["run", "--request", path.to_str().unwrap()]);
+    assert_eq!(code, 0, "{from_json}");
+    assert_eq!(from_json["data"]["counts"]["scores_reused"], 3);
+    for args in [
+        vec!["matrix", "--run", run, "--row-limit", "257"],
+        vec![
+            "results",
+            "--run",
+            run,
+            "--kind",
+            "groups",
+            "--min-score",
+            "0.8",
+        ],
+    ] {
+        let (code, error) = json_output(&data, &args);
+        assert_eq!(code, 2, "{error}");
+    }
+}
+
+#[test]
 fn flags_and_serialized_requests_share_core_results() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("input");

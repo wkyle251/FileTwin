@@ -42,6 +42,7 @@
         "summary",
         "status",
         "page",
+        "matrix",
         "export",
         "profiles",
         "capabilities"

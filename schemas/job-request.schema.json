@@ -165,6 +165,10 @@
           "default": "exact",
           "type": "string"
         },
+        "score_retention": {
+          "$ref": "#/$defs/ScoreRetention",
+          "default": "matches"
+        },
         "threshold_overrides": {
           "additionalProperties": {
             "format": "double",
@@ -180,7 +184,8 @@
       "enum": [
         "scan",
         "index",
-        "compare"
+        "compare",
+        "group"
       ],
       "type": "string"
     },
@@ -206,6 +211,13 @@
         "base64"
       ],
       "type": "object"
+    },
+    "ScoreRetention": {
+      "enum": [
+        "matches",
+        "all"
+      ],
+      "type": "string"
     },
     "Source": {
       "additionalProperties": false,
@@ -293,19 +305,6 @@
   "allOf": [
     {
       "else": {
-        "allOf": [
-          {
-            "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "snapshot_id"
-                  ]
-                }
-              ]
-            }
-          }
-        ],
         "properties": {
           "sources": {
             "minItems": 1,
@@ -319,7 +318,10 @@
       "if": {
         "properties": {
           "operation": {
-            "const": "compare"
+            "enum": [
+              "compare",
+              "group"
+            ]
           }
         },
         "required": [
@@ -379,7 +381,34 @@
               "io_workers": false,
               "staging_bytes": false
             }
-          },
+          }
+        }
+      }
+    },
+    {
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "snapshot_id"
+              ]
+            }
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "compare"
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "then": {
+        "properties": {
           "snapshot_id": {
             "minLength": 1,
             "type": "string"
@@ -387,6 +416,52 @@
         },
         "required": [
           "snapshot_id"
+        ]
+      }
+    },
+    {
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "source_run_id"
+              ]
+            },
+            {
+              "required": [
+                "source_revision"
+              ]
+            }
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "group"
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_revision": {
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source_run_id": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_run_id"
         ]
       }
     },
@@ -521,6 +596,20 @@
       "type": "integer"
     },
     "snapshot_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "source_run_id": {
       "type": [
         "string",
         "null"

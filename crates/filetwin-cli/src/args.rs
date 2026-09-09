@@ -55,6 +55,10 @@ pub enum Command {
     Index(InputArgs),
     /// Compare a saved snapshot without reading the originals.
     Compare(CompareArgs),
+    /// Apply a cutoff and group saved scores without comparing vectors again.
+    Group(GroupArgs),
+    /// Read a bounded similarity matrix from a run created with --all-scores.
+    Matrix(MatrixArgs),
     /// Read a versioned JSON processing request (use - for stdin).
     Run {
         #[arg(long)]
@@ -167,6 +171,9 @@ pub struct CommonLimits {
 
 #[derive(Debug, Args)]
 pub struct MatchingArgs {
+    /// Retain every compatible score. Without --threshold, skip grouping.
+    #[arg(long)]
+    pub all_scores: bool,
     /// Explicit cosine cutoff. A bare SCORE applies to every selected profile.
     #[arg(
         long,
@@ -191,6 +198,38 @@ pub struct CompareArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct GroupArgs {
+    #[arg(long)]
+    pub run: String,
+    #[arg(long)]
+    pub revision: Option<u64>,
+    #[arg(
+        long,
+        value_name = "[FAMILY|PROFILE_ID=]SCORE",
+        allow_hyphen_values = true
+    )]
+    pub threshold: Vec<String>,
+    #[command(flatten)]
+    pub limits: CommonLimits,
+}
+
+#[derive(Debug, Args)]
+pub struct MatrixArgs {
+    #[arg(long)]
+    pub run: String,
+    #[arg(long)]
+    pub revision: Option<u64>,
+    #[arg(long, default_value_t = 0)]
+    pub row_offset: u64,
+    #[arg(long, default_value_t = 0)]
+    pub column_offset: u64,
+    #[arg(long, default_value_t = 128)]
+    pub row_limit: u32,
+    #[arg(long, default_value_t = 128)]
+    pub column_limit: u32,
+}
+
+#[derive(Debug, Args)]
 pub struct TargetArgs {
     #[arg(
         long,
@@ -207,7 +246,7 @@ pub struct TargetArgs {
 pub struct ResultsArgs {
     #[command(flatten)]
     pub target: TargetArgs,
-    #[arg(long,value_parser=["summary","groups","members","pairs","files","locations","errors"])]
+    #[arg(long,value_parser=["summary","groups","members","pairs","scores","files","locations","errors"])]
     pub kind: String,
     #[arg(long)]
     pub group: Option<String>,
@@ -217,6 +256,9 @@ pub struct ResultsArgs {
     pub cursor: Option<String>,
     #[arg(long)]
     pub page_size: Option<u32>,
+    /// Filter saved scores without recalculation; valid only with --kind scores.
+    #[arg(long, allow_hyphen_values = true)]
+    pub min_score: Option<f64>,
 }
 #[derive(Debug, Args)]
 pub struct ExportArgs {

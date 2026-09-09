@@ -51,6 +51,13 @@ pub enum Operation {
     Scan,
     Index,
     Compare,
+    Group,
+}
+
+impl Operation {
+    pub(crate) fn uses_saved_input(self) -> bool {
+        matches!(self, Self::Compare | Self::Group)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -195,7 +202,17 @@ pub struct Matching {
     #[serde(default = "all_pairs")]
     pub grouping: String,
     #[serde(default)]
+    pub score_retention: ScoreRetention,
+    #[serde(default)]
     pub threshold_overrides: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreRetention {
+    #[default]
+    Matches,
+    All,
 }
 fn exact() -> String {
     "exact".into()
@@ -208,8 +225,24 @@ impl Default for Matching {
         Self {
             retrieval: exact(),
             grouping: all_pairs(),
+            score_retention: ScoreRetention::Matches,
             threshold_overrides: BTreeMap::new(),
         }
+    }
+}
+
+impl Matching {
+    /// Save every compatible non-self score without thresholds or grouping.
+    pub fn all_scores() -> Self {
+        Self {
+            grouping: "none".into(),
+            score_retention: ScoreRetention::All,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn needs_thresholds(&self) -> bool {
+        self.score_retention == ScoreRetention::Matches || self.grouping == "all_pairs"
     }
 }
 
@@ -260,6 +293,10 @@ pub struct JobRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recursive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub families: Option<Vec<String>>,
@@ -287,6 +324,8 @@ impl Default for JobRequest {
             operation: Operation::Scan,
             sources: None,
             snapshot_id: None,
+            source_run_id: None,
+            source_revision: None,
             recursive: None,
             families: None,
             profiles: None,
@@ -359,6 +398,38 @@ impl JobRequest {
         request
     }
 
+    pub fn experimental_scores(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut request = Self::experimental_index(paths);
+        request.operation = Operation::Scan;
+        request.matching = Some(Matching::all_scores());
+        request
+    }
+
+    pub fn text_scores(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut request = Self::text_index(paths);
+        request.operation = Operation::Scan;
+        request.matching = Some(Matching::all_scores());
+        request
+    }
+
+    pub fn group_scores(run_id: impl Into<String>, thresholds: BTreeMap<String, f64>) -> Self {
+        Self {
+            operation: Operation::Group,
+            source_run_id: Some(run_id.into()),
+            matching: Some(Matching {
+                threshold_overrides: thresholds,
+                ..Matching::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn retains_scores(&self) -> bool {
+        self.matching
+            .as_ref()
+            .is_some_and(|m| m.score_retention == ScoreRetention::All)
+    }
+
     pub(crate) fn resolve(mut self) -> Result<Self> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(Error::new(
@@ -367,7 +438,14 @@ impl JobRequest {
                 "Only schema_version 1 is supported",
             ));
         }
-        if self.operation == Operation::Compare {
+        if self.operation != Operation::Group
+            && (self.source_run_id.is_some() || self.source_revision.is_some())
+        {
+            return Err(Error::invalid(
+                "source_run_id and source_revision are only valid for group",
+            ));
+        }
+        if self.operation.uses_saved_input() {
             if self.sources.is_some()
                 || self.profiles.is_some()
                 || self.filters.is_some()
@@ -375,10 +453,23 @@ impl JobRequest {
                 || self.cache.is_some()
                 || self.exact_duplicates.is_some()
                 || self.recursive.is_some()
-                || self.snapshot_id.as_ref().is_none_or(String::is_empty)
             {
                 return Err(Error::invalid(
-                    "compare requires snapshot_id and rejects discovery/encoding settings",
+                    "compare and group reject discovery/encoding settings",
+                ));
+            }
+            if self.operation == Operation::Compare
+                && self.snapshot_id.as_ref().is_none_or(String::is_empty)
+            {
+                return Err(Error::invalid("compare requires snapshot_id"));
+            }
+            if self.operation == Operation::Group
+                && (self.source_run_id.as_ref().is_none_or(String::is_empty)
+                    || self.source_revision == Some(0)
+                    || self.snapshot_id.is_some())
+            {
+                return Err(Error::invalid(
+                    "group requires source_run_id, an optional positive source_revision, and no snapshot_id",
                 ));
             }
         } else {
@@ -467,13 +558,27 @@ impl JobRequest {
                 return Err(Error::invalid("index rejects matching and pair_scope"));
             }
         } else {
-            self.pair_scope.get_or_insert(PairScope::AllSelected);
+            if self.operation != Operation::Group {
+                self.pair_scope.get_or_insert(PairScope::AllSelected);
+            }
             let m = self.matching.get_or_insert_with(Matching::default);
-            if m.retrieval != "exact" || m.grouping != "all_pairs" {
+            if m.retrieval != "exact" || !["all_pairs", "none"].contains(&m.grouping.as_str()) {
                 return Err(Error::new(
                     ErrorCode::UnsupportedCapability,
                     "validation",
-                    "Only exact retrieval and all_pairs grouping are implemented",
+                    "Only exact retrieval and all_pairs or none grouping are implemented",
+                ));
+            }
+            if self.operation == Operation::Group
+                && (m.score_retention != ScoreRetention::Matches || m.grouping != "all_pairs")
+            {
+                return Err(Error::invalid(
+                    "group requires all_pairs grouping and matches score retention",
+                ));
+            }
+            if !m.needs_thresholds() && !m.threshold_overrides.is_empty() {
+                return Err(Error::invalid(
+                    "Scoring without grouping does not use thresholds",
                 ));
             }
             if m.threshold_overrides
@@ -484,12 +589,12 @@ impl JobRequest {
                     "Thresholds must be finite numbers in [-1, 1]",
                 ));
             }
-            if self.operation != Operation::Compare {
+            if !self.operation.uses_saved_input() {
                 self.validate_thresholds(self.profiles.as_ref().expect("Selected profiles"))?;
             }
         }
         let limits = self.limits.get_or_insert_with(Limits::default);
-        if self.operation == Operation::Compare
+        if self.operation.uses_saved_input()
             && (limits.staging_bytes.is_some()
                 || limits.io_workers.is_some()
                 || limits.inference_workers.is_some()
@@ -497,12 +602,12 @@ impl JobRequest {
                 || limits.download_bytes_per_second.is_some())
         {
             return Err(Error::invalid(
-                "compare accepts only memory, result, and wall-time limits",
+                "compare and group accept only memory, result, and wall-time limits",
             ));
         }
         limits.memory_bytes.get_or_insert(2 * 1024 * 1024 * 1024);
         limits.result_bytes.get_or_insert(1024 * 1024 * 1024);
-        if self.operation != Operation::Compare {
+        if !self.operation.uses_saved_input() {
             limits.staging_bytes.get_or_insert(10 * 1024 * 1024 * 1024);
             limits.io_workers.get_or_insert(2);
             limits.inference_workers.get_or_insert(1);
@@ -547,6 +652,9 @@ impl JobRequest {
         let Some(m) = &self.matching else {
             return Ok(());
         };
+        if !m.needs_thresholds() {
+            return Ok(());
+        }
         if m.threshold_overrides.len() != selected.len()
             || selected
                 .values()
@@ -607,7 +715,7 @@ pub fn validate_request_shape(value: &Value) -> Result<()> {
             "Finite budgets and worker counts cannot be null",
         ));
     }
-    if operation == "compare" {
+    if ["compare", "group"].contains(&operation) {
         if [
             "sources",
             "families",
@@ -621,7 +729,7 @@ pub fn validate_request_shape(value: &Value) -> Result<()> {
         .any(|k| object.contains_key(*k))
         {
             return Err(Error::invalid(
-                "compare rejects discovery/encoding fields, including explicit nulls",
+                "compare and group reject discovery/encoding fields, including explicit nulls",
             ));
         }
         if object
@@ -640,7 +748,7 @@ pub fn validate_request_shape(value: &Value) -> Result<()> {
             })
         {
             return Err(Error::invalid(
-                "compare accepts only memory, result, and wall-time limits",
+                "compare and group accept only memory, result, and wall-time limits",
             ));
         }
     }
@@ -653,6 +761,15 @@ pub fn validate_request_shape(value: &Value) -> Result<()> {
     }
     if operation != "compare" && object.contains_key("snapshot_id") {
         return Err(Error::invalid("snapshot_id is only valid for compare"));
+    }
+    if operation != "group"
+        && ["source_run_id", "source_revision"]
+            .iter()
+            .any(|k| object.contains_key(*k))
+    {
+        return Err(Error::invalid(
+            "source_run_id and source_revision are only valid for group",
+        ));
     }
     Ok(())
 }
@@ -669,6 +786,10 @@ pub struct Counts {
     pub bytes_read: u64,
     pub bytes_hashed: u64,
     pub pairs_compared: u64,
+    #[serde(default)]
+    pub scores_retained: u64,
+    #[serde(default)]
+    pub scores_reused: u64,
     pub similar_pairs: u64,
     pub groups: u64,
     pub exact_pairs: u64,
@@ -775,6 +896,7 @@ pub struct ResultsQuery {
     pub result_revision: Option<u64>,
     pub cursor: Option<String>,
     pub page_size: Option<u32>,
+    pub min_score: Option<f64>,
 }
 
 impl Default for ResultsQuery {
@@ -790,6 +912,7 @@ impl Default for ResultsQuery {
             result_revision: None,
             cursor: None,
             page_size: None,
+            min_score: None,
         }
     }
 }
@@ -802,6 +925,80 @@ pub struct ResultPage {
     pub kind: String,
     pub items: Vec<Value>,
     pub next_cursor: Option<String>,
+}
+
+/// A bounded rectangular view of a saved score run. Offsets are zero-based and
+/// both axes follow immutable snapshot file order (file_id order).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixQuery {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub result_revision: Option<u64>,
+    #[serde(default)]
+    pub row_offset: u64,
+    #[serde(default)]
+    pub column_offset: u64,
+    #[serde(default = "matrix_limit")]
+    pub row_limit: u32,
+    #[serde(default = "matrix_limit")]
+    pub column_limit: u32,
+}
+
+fn matrix_limit() -> u32 {
+    128
+}
+
+impl MatrixQuery {
+    pub fn new(run_id: impl Into<String>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            run_id: run_id.into(),
+            result_revision: None,
+            row_offset: 0,
+            column_offset: 0,
+            row_limit: matrix_limit(),
+            column_limit: matrix_limit(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MatrixFile {
+    pub file_id: String,
+    pub vector_id: Option<String>,
+    pub locator: Source,
+    pub family: Option<String>,
+    pub profile_id: Option<String>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatrixUnavailable {
+    FileUnavailable,
+    IncompatibleProfile,
+    OutsideScope,
+    NotComputed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MatrixPage {
+    pub snapshot_id: String,
+    pub run_id: String,
+    pub result_revision: u64,
+    pub metric: String,
+    pub score_range: [f64; 2],
+    pub total_files: u64,
+    pub row_offset: u64,
+    pub column_offset: u64,
+    pub rows: Vec<MatrixFile>,
+    pub columns: Vec<MatrixFile>,
+    pub scores: Vec<Vec<Option<f64>>>,
+    pub unavailable_reasons: Vec<Vec<Option<MatrixUnavailable>>>,
+    pub next_row_offset: Option<u64>,
+    pub next_column_offset: Option<u64>,
+    pub completeness: Completeness,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

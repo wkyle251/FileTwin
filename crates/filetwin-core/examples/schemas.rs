@@ -19,9 +19,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut request = schema::<JobRequest>();
     request["properties"]["schema_version"]["const"] = json!(1);
     request["allOf"] = json!([
+        {"if":{"required":["operation"],"properties":{"operation":{"enum":["compare","group"]}}},
+         "then":{"properties":{"limits":{"properties":{"staging_bytes":false,"io_workers":false,"inference_workers":false,"download_bytes":false,"download_bytes_per_second":false}}},"allOf":[absent(&["sources","families","profiles","filters","cache","recursive","exact_duplicates"])]},
+         "else":{"required":["sources"],"properties":{"sources":{"type":"array","minItems":1}}}},
         {"if":{"required":["operation"],"properties":{"operation":{"const":"compare"}}},
-         "then":{"required":["snapshot_id"],"properties":{"snapshot_id":{"type":"string","minLength":1},"limits":{"properties":{"staging_bytes":false,"io_workers":false,"inference_workers":false,"download_bytes":false,"download_bytes_per_second":false}}},"allOf":[absent(&["sources","families","profiles","filters","cache","recursive","exact_duplicates"])]},
-         "else":{"required":["sources"],"properties":{"sources":{"type":"array","minItems":1}},"allOf":[absent(&["snapshot_id"])]}},
+         "then":{"required":["snapshot_id"],"properties":{"snapshot_id":{"type":"string","minLength":1}}},
+         "else":absent(&["snapshot_id"])},
+        {"if":{"required":["operation"],"properties":{"operation":{"const":"group"}}},
+         "then":{"required":["source_run_id"],"properties":{"source_run_id":{"type":"string","minLength":1},"source_revision":{"type":["integer","null"],"minimum":1}}},
+         "else":absent(&["source_run_id","source_revision"])},
         {"if":{"required":["operation"],"properties":{"operation":{"const":"index"}}},"then":absent(&["matching","pair_scope"])}
     ]);
     request["$defs"]["Source"]["oneOf"] = json!([
@@ -33,7 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     envelope["properties"]["schema_version"]["const"] = json!(1);
     envelope["properties"]["sequence"]["minimum"] = json!(1);
     envelope["properties"]["data"] = json!({"type":"object"});
-    envelope["properties"]["type"] = json!({"enum":["accepted","progress","error","summary","status","page","export","profiles","capabilities"]});
+    envelope["properties"]["type"] = json!({"enum":["accepted","progress","error","summary","status","page","matrix","export","profiles","capabilities"]});
+    let mut matrix_query = schema::<MatrixQuery>();
+    matrix_query["properties"]["schema_version"]["const"] = json!(1);
+    for key in ["row_limit", "column_limit"] {
+        matrix_query["properties"][key]["minimum"] = json!(1);
+        matrix_query["properties"][key]["maximum"] = json!(256);
+    }
     let entries = [
         ("job-request", request),
         ("envelope", envelope),
@@ -42,6 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("status-query", schema::<StatusQuery>()),
         ("export-request", schema::<ExportRequest>()),
         ("result-page", schema::<ResultPage>()),
+        ("matrix-query", matrix_query),
+        ("matrix-page", schema::<MatrixPage>()),
         ("error", schema::<Error>()),
         ("profile", schema::<Profile>()),
     ];

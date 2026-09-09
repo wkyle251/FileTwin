@@ -5,7 +5,7 @@ Date: 2026-09-09.
 Selected implementation language: **Rust** for a reusable library and CLI.
 Product interface: **CLI only**, with direct Rust library integration.
 Selected release targets: **Apple Silicon macOS and Ubuntu Linux on x86-64/ARM64**.
-Revision: all four encoding routes implemented and format coverage expanded; calibration and release qualification remain pending.
+Revision: all four encoding routes, retained pair scores, matrix pages and grouping from saved scores implemented; calibration and release qualification remain pending.
 
 The proposed application input/output contract is in
 [section 12](#12-application-input-and-output-contract).
@@ -29,13 +29,16 @@ typed processing requests/errors; JSON/JSONL and schemas; local discovery;
 UTF-8/DOCX/PDF text extraction; SSCD images; recording-level spectral landmarks;
 sampled/pooled SSCD video; SHA-256 evidence; SQLite and cache reuse; immutable
 snapshots; exhaustive cosine matching and groups partitioned by family/profile;
-queries, exports, cancellation and resume. All ten public commands are available.
+queries, exports, cancellation and resume. All twelve public commands, including
+`matrix` and `group`, are available. `--all-scores` separates score retention
+from thresholds and grouping; score queries can filter saved measurements.
 Native artifacts are provisioned explicitly and verified, with no downloads
 during processing. Docker and Python are not production dependencies.
 
 The preview requires explicit profile selection (`--experimental` selects all
 four current profiles; `--experimental-text` retains the original UTF-8 profile)
-and an explicit threshold for every selected profile. It has no promoted
+and an explicit threshold for every selected profile when grouping. Full-score
+retention with grouping disabled requires no cutoff. It has no promoted
 profile or calibrated default. Immutable manifests are available through
 `profiles list`; changed representation semantics require a different profile ID.
 
@@ -53,8 +56,9 @@ Important differences from the target design:
   Native input uses one full bounded staged copy, so frame/audio sampling saves
   decode/inference work but does not avoid reading the original source bytes.
 - The scorer is the bounded reference implementation. BLAS kernels, parallel
-  extraction tuning, unchanged pair-score reuse and 10 TB measurements are
+  extraction tuning, incremental pair-score reuse across snapshots and 10 TB measurements are
   deferred. Section 9's experiments do not measure the new executable.
+  Filtering and grouping an existing full-score run reuse persisted scores.
 - `result_bytes` currently limits charged inventory/pair work and group
   reservations, not total database/WAL/publication/export bytes. Memory is bounded
   by implementation buffers and admission checks; Linux workers additionally
@@ -73,7 +77,10 @@ Important differences from the target design:
   selected native macOS/Ubuntu matrix; remote CI, the minimum OS floor, signed
   distribution and other filesystems remain release qualification work.
 
-Database schema version 1 and protocol version 1 are explicit preview formats.
+Database schema version 2 and protocol version 1 are explicit preview formats.
+The engine transactionally upgrades v1 indexes by adding a grouping cursor;
+existing snapshots, vectors, IDs and publications remain unchanged. Read-only
+queries also accept v1 indexes. Older binaries refuse upgraded v2 indexes.
 Query/catalog record payloads remain extensible JSON values in the Rust API;
 processing requests, events, errors, summaries and query inputs have shared Rust
 types. Public API stability is not yet promised.
@@ -194,8 +201,11 @@ flowchart TD
     R --> V
     V --> B[Snapshot compatible vectors by family]
     B --> X[Exact blocks or declared approximate candidates]
-    X --> Y[Score original vectors and apply thresholds]
-    Y --> G[Build conservative similarity groups]
+    X --> Y[Score original vectors]
+    Y --> Pairs[Retain all scores or qualifying pairs]
+    Pairs --> Matrix[Matrix pages and filtered score queries]
+    Pairs --> G[Optional threshold decisions and conservative groups]
+    Matrix --> U
     G --> U[Publish result pages, summaries, and progress events]
     Z --> U
     D --> J[Optional whole-file digest checks]
@@ -1047,8 +1057,10 @@ must refer to the same stable content revision; use a snapshot or equivalent
 source guarantee when strict consistency is required. Deleted or content-changed
 files invalidate their current bindings and current-result eligibility. Retained
 snapshots and published results remain historical evidence; they are not rewritten
-or deleted by a reconciliation scan. Changing only a similarity threshold
-requires comparison/grouping again, not file re-encoding.
+or deleted by a reconciliation scan. For a full-score run, changing only a
+threshold requires filtering/grouping the retained scores; it requires neither
+encoding nor vector comparison. A threshold-only run may need missing scores
+computed again when the cutoff is lowered.
 
 Suggested per-file processing states are `discovered`, `queued`, `encoding`, `ready`, `stale`,
 `insufficient_content`, `unsupported`, `failed`, and `cancelled`.
@@ -1074,8 +1086,10 @@ block_scores = vectors_block_A * transpose(vectors_block_B)
 ```
 
 Process only the upper triangle of each group's matrix, excluding self-matches.
-Use bounded blocks, initially around 1,024 rows, and apply the group's threshold
-to each block before reusing its working memory.
+Use bounded blocks, initially around 1,024 rows. With `score_retention=all`,
+persist each compatible non-self score before reusing working memory. With
+`score_retention=matches`, retain only qualifying pairs. The reference preview
+uses smaller bounded batches; the native block kernel remains planned.
 
 ```text
 for each compatible comparison group:
@@ -1083,8 +1097,8 @@ for each compatible comparison group:
     for each upper-triangle pair of row blocks:
         load or reuse the two required vector blocks
         compute dot products with native matrix operations
-        retain qualifying non-self pairs
-    build groups from retained evidence
+        retain all non-self scores or only qualifying pairs, according to policy
+    optionally build groups from retained evidence
 ```
 
 Keep all vectors resident only when they fit the configured memory budget.
@@ -1101,7 +1115,23 @@ pairs_in_group = N * (N - 1) / 2
 total_pairs = sum(pairs_in_group for each compatible group)
 ```
 
-For incremental scans, unchanged-to-unchanged scores can be reused when the
+Within an existing full-score run, matrix reads, cutoff queries, and `group`
+use immutable score records without loading vectors. A group request freezes
+its source run/revision and original pair scope. Partial score publications can
+be queried but cannot supply a supposedly complete grouped result: `group`
+requires exhaustive comparison coverage. Failed files remain explicit outcomes.
+
+Full matrices are views over unique pair records, not the default persisted
+representation. Matrix queries return bounded rectangular pages, each at most
+256 rows by 256 columns and 4 MiB. They carry file axes, snapshot/run/revision,
+metric, scores, null reasons, independent row/column continuations, and source/
+comparison coverage. A valid diagonal is 1 and does not count as duplicate
+evidence. Incompatible profiles, unavailable files, scope exclusions, and
+uncomputed pairs have distinct null reasons. Real zero/negative scores remain
+numbers. Full-score retention still has quadratic storage cost; response paging
+does not remove that cost or replace the configured result-work allowance.
+
+For future incremental scans, unchanged-to-unchanged scores can be reused when the
 profile, scope, and threshold policy allow it. Compare changed or new vectors
 with compatible cached vectors, then rebuild affected groups. Retaining only
 above-threshold scores means lowering the threshold requires calculating missing
@@ -1632,8 +1662,10 @@ evaluated for recall before replacing exhaustive matching.
 
 ## 12. Application input and output contract
 
-Status: proposed interface; names and defaults below are design decisions, not
-implemented commands, released library signatures, or an existing network API.
+Status: shared CLI/library contract and release design. The native command
+surface is implemented; this section also describes planned cloud integration,
+promoted profiles and release defaults. The README and generated schemas define
+the exact current interfaces. There is no network API.
 The CLI and library share processing request/result types. Users normally supply
 only source files or folders. Profiles and application settings supply the
 remaining defaults, and every accepted job records its fully resolved settings.
@@ -1645,11 +1677,13 @@ change encoding, matching, or cache identities.
 
 ### Entry points and command surface
 
-| Proposed CLI command | Library input/operation | Output and lifetime |
+| CLI command | Library input/operation | Output and lifetime |
 | --- | --- | --- |
-| `filetwin scan PATH...` | `submit(JobRequest { operation: scan, ... })` | Discover, index, compare, and group. Foreground until the attempt ends; return IDs, coverage, and summary. |
+| `filetwin scan PATH...` | `submit(JobRequest { operation: scan, ... })` | Discover, index, compare, and optionally group. Foreground until the attempt ends; return IDs, coverage, and summary. |
 | `filetwin index PATH...` | `submit(JobRequest { operation: index, ... })` | Populate the cache and publish a vector snapshot; no similarity run. |
 | `filetwin compare --snapshot ID` | `submit(JobRequest { operation: compare, ... })` | Compare an existing snapshot; no original-file reads, hashes, or encoder calls. |
+| `filetwin matrix --run ID` | `Catalog::matrix(MatrixQuery)` | A bounded matrix page from immutable saved scores, with ordered file axes and null reasons. |
+| `filetwin group --run ID` | `submit(JobRequest { operation: group, ... })` | Filter an exhaustive score revision and build a new grouped run without scoring vectors again. |
 | `filetwin run --request FILE` | Deserialize one `JobRequest`, then submit it. | Same job behavior as the corresponding command; `--request -` reads one JSON object from stdin through EOF. |
 | `filetwin resume --job ID` | Resume the stored job after acquiring processing ownership. | Continue eligible unfinished work in the foreground; emit a new attempt ID. |
 | `filetwin status --job ID` | `Catalog::status(StatusQuery)` | One current job-status response, including coverage, owner state, and resumability. |
@@ -1660,7 +1694,7 @@ change encoding, matching, or cache identities.
 
 Use an explicit command; bare `filetwin` prints help. `scan` remains the default
 `operation` inside a processing request. The `run` command accepts only
-`scan`, `index`, or `compare` requests; queries and resume use their own typed
+`scan`, `index`, `compare`, or `group` requests; queries and resume use their own typed
 inputs and commands. A host should launch the executable with an argument array,
 send JSON directly when needed, and retain its process handle for cancellation.
 It should not construct shell command strings from source paths.
@@ -1808,6 +1842,8 @@ profiles or calibrated default thresholds have been selected.
 | `operation` | No. | `scan` | Select the operation above. |
 | `sources` | For `scan` / `index`. | None. | Files, directories, or configured cloud roots to inspect. |
 | `snapshot_id` | For `compare`. | None. | Exact cached-vector snapshot to compare. |
+| `source_run_id` | For `group`. | None. | A run that retained all compatible pairwise scores. |
+| `source_revision` | No; `group` only. | Freeze the latest published score revision. | Positive revision with exhaustive comparison coverage. |
 | `recursive` | No. | `true` | Descend into selected directories. |
 | `families` | No. | The release manifest's promoted `default_families`. | Select from `text`, `image`, `audio`, `video`; documents use text. Record defaults and exclusions explicitly. |
 | `filters` | No. | No caller-specified restrictions. | Include/exclude paths or extensions, hidden files, and optional byte-size limits. |
@@ -1821,10 +1857,11 @@ Console/report settings are not `JobRequest` fields. Persist results locally
 and return IDs/summaries; select console presentation through `--format` and
 report files through a separate `ExportRequest`.
 
-`sources` is omitted from `compare`; the snapshot already defines its files
+`sources` is omitted from `compare` and `group`; the saved input defines its files
 and source memberships. In that operation, profiles, filters, families, cache
 generation settings, and exact-copy computation cannot be changed. Matching
-thresholds, retrieval settings, pair scope, and execution limits may change.
+thresholds and execution limits may change. `compare` may also change pair scope;
+`group` inherits its source run's scope and requires exact saved scores.
 Disallow incompatible fields instead of silently ignoring them.
 
 An `index` request omits `matching` and `pair_scope`; it does not produce
@@ -1834,7 +1871,7 @@ byte-identity evidence already bound to its snapshot; it never calculates a new
 source digest.
 
 Operation validation applies before defaults are filled: scan/index-only fields
-do not leak from configuration into `compare`, and matching defaults do not
+do not leak from configuration into `compare` or `group`, and matching defaults do not
 become fields of `index`. Resume loads its stored request instead of resolving
 new processing defaults.
 
@@ -1846,15 +1883,16 @@ new processing defaults.
 | `--profile FAMILY=PROFILE_ID` | `profiles[FAMILY]` | Repeat for different selected families in `scan`, `index`. |
 | `--pair-scope SCOPE` | `pair_scope` | `all_selected` or `within_each_source`; `scan`, `compare`. |
 | `--retrieval exact` | `matching.retrieval` | `scan`, `compare`; reject approximate mode until implemented. |
-| `--threshold PROFILE_ID=SCORE` | `matching.threshold_overrides[PROFILE_ID]` | Repeat for distinct compatible profiles in `scan`, `compare`. |
+| `--threshold PROFILE_ID=SCORE` | `matching.threshold_overrides[PROFILE_ID]` | Repeat for distinct compatible profiles in `scan`, `compare`, `group`; a bare score applies to all selected profiles. |
+| `--all-scores` | `matching.score_retention=all` | `scan`, `compare`; without an explicit threshold, also set `grouping=none` and clear configured thresholds. |
 | `--cache-mode MODE` | `cache.mode` | `reuse` or `refresh`; `scan`, `index`. |
 | `--validation POLICY` | `cache.validation` | `fast` or `strict`; `scan`, `index`. |
 | `--exact-duplicates MODE` | `exact_duplicates` | `reuse_known`, `compute`, or `off`; `scan`, `index`. Index stores evidence without grouping. |
 | `--import-sidecars` / `--no-import-sidecars` | `cache.import_sidecars` | `scan`, `index`; default false. |
 | `--export-sidecars` / `--no-export-sidecars` | `cache.export_sidecars` | `scan`, `index`; default false. |
 
-The first version fixes `matching.grouping` to `all_pairs`; unknown group rules
-are rejected. Repeated map options must use distinct keys. `compare` reuses only
+The preview accepts `matching.grouping` values `all_pairs` and `none`; unknown
+group rules are rejected. Repeated map options must use distinct keys. `compare` reuses only
 the byte-identity evidence already bound to its snapshot. Its `exact_duplicates`
 field is omitted, so it cannot trigger a new hash or change discovery settings.
 It inherits the snapshot's exact-copy reporting policy: `off` stays off; the
@@ -1910,7 +1948,8 @@ normally. Round-trip tests must cover both forms without lossy replacement.
 | --- | --- | --- |
 | `matching.retrieval` | `exact` | `approximate` is a later explicit mode; it always carries comparison-recall limitations. |
 | `matching.threshold_overrides` | None. | Map a resolved profile ID to a finite minimum cosine score in [-1, 1]. Overrides change decision policy, not vectors. |
-| `matching.grouping` | `all_pairs` | Use the deterministic conservative partition from section 8. A candidate component is not automatically a displayed group. |
+| `matching.score_retention` | `matches` | `all` retains every compatible score for matrices and later filtering; `matches` retains only qualifying pairs. |
+| `matching.grouping` | `all_pairs` | Use the deterministic conservative partition from section 8, or `none` to skip grouping. A candidate component is not automatically a displayed group. |
 | `profiles` | Installed default profile for each selected family. | Optional family-to-profile-ID selection for `scan` / `index`; resolve and freeze IDs at acceptance. |
 | `cache.mode` | `reuse` | `refresh` explicitly regenerates selected representations instead of taking a cached-vector shortcut. |
 | `cache.validation` | `fast` | `strict` verifies whole-file digests or equivalent trusted evidence under section 6; may require reading every byte. |
@@ -1922,7 +1961,18 @@ profile needs a calibrated decision policy. An explicit threshold can be used
 for evaluation, but it must be marked as an override with its calibration status.
 Unknown profiles, incompatible dimensions/metrics, or a missing default policy
 fail validation before expensive processing. An `index` job needs no matching
-threshold because it does not compare files.
+threshold because it does not compare files. A full-score job with
+`score_retention=all` and `grouping=none` also requires no cutoff and rejects
+threshold overrides that would be unused. `--all-scores` selects this combination
+when no explicit threshold is supplied; a threshold plus `--all-scores` retains
+all scores and also groups qualifying pairs.
+
+`operation=group` instead requires `source_run_id`, an optional positive
+`source_revision`, and profile thresholds. It rejects discovery/encoding
+settings and uses the original pair scope. Its accepted request pins the score
+revision; its output is a new run with `scores_reused`, zero `pairs_compared`,
+and no source or vector reads. Grouping checkpoints persist the score-record
+cursor, counters, consumed allowance and accepted pair records atomically.
 
 Encoder name, vector dimension, video frame count, audio clip policy, OCR policy,
 and aggregation weights belong in the immutable profile rather than independent
@@ -2014,7 +2064,8 @@ forms carry `schema_version` and optional `request_id` like processing requests.
 | `StatusQuery.job_id` | `status --job ID` | Required. Read saved state and observed ownership without starting work. |
 | `ResultsQuery.run_id` | `results --run ID` | Select comparison results; mutually exclusive with `snapshot_id`. |
 | `ResultsQuery.snapshot_id` | `results --snapshot ID` | Select index-only records; valid kinds are `files`, `locations`, and `errors`. |
-| `ResultsQuery.kind` | `--kind KIND` | Required: `summary`, `groups`, `members`, `pairs`, `files`, `locations`, or `errors`, subject to the selected source. |
+| `ResultsQuery.kind` | `--kind KIND` | Required: `summary`, `groups`, `members`, `pairs`, `scores`, `files`, `locations`, or `errors`, subject to the selected source. |
+| `ResultsQuery.min_score` | `--min-score S` | Inclusive finite cutoff in [-1, 1], valid only for `scores`. Omit for every retained compatible pair; cursors bind the cutoff. |
 | `ResultsQuery.group_id` | `--group ID` | Required for `members`; invalid for other kinds. Group headers and member lists are separate queries. |
 | `ResultsQuery.file_id` | `--file ID` | Required for `locations`; invalid for other kinds. Page every observed path for that file within the selected snapshot. |
 | `ResultsQuery.result_revision` | `--revision N` | Optional; initially pin the latest published revision and return its ID. A cursor pins its existing revision. |
@@ -2024,6 +2075,9 @@ forms carry `schema_version` and optional `request_id` like processing requests.
 | `ExportRequest.result_revision` | `--revision N` | Optional; pin one published revision for the entire export. |
 | `ExportRequest.format` | `--report-format FORMAT` | Required: `json`, `jsonl`, or `csv`. Independent of console `--format`. |
 | `ExportRequest.directory` | `--report-dir DIR` | Required new destination directory; refuse an existing destination. |
+| `MatrixQuery.run_id`, `result_revision` | `matrix --run ID [--revision N]` | Select an immutable full-score revision; pin the returned revision when requesting subsequent windows. |
+| `MatrixQuery.row_offset`, `column_offset` | `--row-offset N --column-offset N` | Zero-based offsets into the same ordered file list. |
+| `MatrixQuery.row_limit`, `column_limit` | `--row-limit N --column-limit N` | Default 128 per axis, range 1–256; also limited by the 4 MiB response ceiling. |
 
 The `summary` kind returns one record and rejects group/file/cursor/page-size flags.
 Other kinds page independently. An item too large for the page-byte bound
@@ -2035,6 +2089,8 @@ Publish each export through a temporary sibling directory and an atomic final
 rename where supported. A successful manifest lists the selected revision,
 schema version, artifacts, record counts, and completeness. CSV emits separate
 files for group headers, members, pairs, files, locations, errors, and summary as applicable.
+Full-score runs additionally export `scores`; the matrix is a query view over
+these unique non-self pair records. It does not duplicate mirrored score records.
 JSON and JSONL exports are also streamed from persisted pages; they do not
 require loading the entire run. An export failure does not change analysis
 results, and incomplete output must not appear as a completed report.
@@ -2085,6 +2141,8 @@ Request IDs correlate retries but do not deduplicate them automatically.
 | Member/file | `file_id`, source memberships, representative locator, `location_count`, format, bytes, dimensions/duration/pages where available, profile/vector IDs, revision, freshness, extraction coverage, processing state | A file object with separately paginated locations; the representative locator does not hide other paths. |
 | File location | `location_id`, `file_id`, source membership, lossless locator, observation/availability state | One observed path; hard links and overlapping roots reuse the file's vector without discarding locations. |
 | Related pair | File/vector IDs, `match_kind`, score/metric/threshold or byte-identity evidence | Includes qualifying pairs crossing final group boundaries. |
+| Saved score | File/vector IDs, family/profile, scorer, metric, raw score, calibration status | `match_kind=similarity_score`; a measurement independent of any cutoff, with each compatible non-self pair retained once. |
+| Matrix page | Snapshot/run/revision, metric, file axes, numeric/null scores, null reasons, row/column offsets and continuations, completeness | A bounded view over saved scores; self-similarity is excluded from pair/group evidence. |
 | Completeness | Source coverage, comparison coverage, retrieval mode, exclusions, failed/skipped counts, limits reached, digest coverage | Distinguishes requested scope, sampling, failures, and unfinished/approximate comparisons. |
 | Error | `code`, `stage`, `source_id`, `file_id`, `retryable`, `fatal`, `message`, `details` | Stable code plus human explanation; IDs are null when not applicable. Known error conditions are typed in the library. |
 | Export manifest | Selected snapshot/run/revision, report format, artifacts, counts, completeness | Identifies completed exported files; no raw vectors by default. |
@@ -2421,8 +2479,9 @@ returns exit code `2`. Error messages may change; the code remains the contract:
 
 An `all_pairs` group minimum is the lowest original-vector score among its
 members. Neither that score nor the threshold is a percentage of common content.
-The interface does not return a dense all-pairs matrix, invented overlap
-timestamps, raw vectors by default, or instructions to delete similar files.
+The `matrix` interface returns a bounded dense window over saved pair scores,
+with explicit nulls for unavailable comparisons. It does not invent overlap
+timestamps or return raw vectors or deletion instructions by default.
 
 ## 13. Architecture review and implementation readiness
 

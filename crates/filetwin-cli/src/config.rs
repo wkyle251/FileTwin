@@ -164,12 +164,15 @@ impl Configuration {
 
     pub fn defaults_for(&self, operation: &str) -> Value {
         let mut defaults = self.defaults.clone();
-        if operation == "compare" {
+        if ["compare", "group"].contains(&operation) {
             defaults.retain(|key, _| ["matching", "pair_scope", "limits"].contains(&key.as_str()));
             if let Some(Value::Object(limits)) = defaults.get_mut("limits") {
                 limits.retain(|key, _| {
                     ["memory_bytes", "result_bytes", "wall_time_seconds"].contains(&key.as_str())
                 });
+            }
+            if operation == "group" {
+                defaults.remove("pair_scope");
             }
         } else if operation == "index" {
             defaults.remove("matching");
@@ -184,7 +187,7 @@ impl Configuration {
         matching: Option<&MatchingArgs>,
         common: Option<&CommonLimits>,
         operation: &str,
-        snapshot: Option<&str>,
+        saved_input: Option<&str>,
         request_id: &str,
     ) -> Result<JobRequest> {
         let mut value = self.defaults_for(operation);
@@ -308,15 +311,31 @@ impl Configuration {
                 overrides["pair_scope"] = json!(scope);
             }
             let mut matching_value = json!({});
+            if operation == "group" {
+                matching_value["score_retention"] = json!("matches");
+                matching_value["grouping"] = json!("all_pairs");
+            }
+            if matching.all_scores {
+                matching_value["score_retention"] = json!("all");
+                if matching.threshold.is_empty() {
+                    matching_value["grouping"] = json!("none");
+                    matching_value["threshold_overrides"] = json!({});
+                }
+            }
             if let Some(retrieval) = &matching.retrieval {
                 matching_value["retrieval"] = json!(retrieval);
             }
             if !matching.threshold.is_empty() {
+                matching_value["grouping"] = json!("all_pairs");
                 let selected: std::collections::BTreeMap<String, String> = if let Some(sid) =
-                    snapshot
+                    saved_input
                 {
-                    filetwin_core::Catalog::open_read_only(&self.engine.data_dir)?
-                        .snapshot_profiles(sid)?
+                    let catalog = filetwin_core::Catalog::open_read_only(&self.engine.data_dir)?;
+                    if operation == "group" {
+                        catalog.score_run_profiles(sid)?
+                    } else {
+                        catalog.snapshot_profiles(sid)?
+                    }
                 } else {
                     serde_json::from_value(
                         overrides
@@ -357,8 +376,12 @@ impl Configuration {
                 overrides["matching"] = matching_value;
             }
         }
-        if let Some(snapshot) = snapshot {
-            overrides["snapshot_id"] = json!(snapshot);
+        if let Some(id) = saved_input {
+            overrides[if operation == "group" {
+                "source_run_id"
+            } else {
+                "snapshot_id"
+            }] = json!(id);
         }
         merge(&mut value, overrides);
         Ok(serde_json::from_value(value)?)
