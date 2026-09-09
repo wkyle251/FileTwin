@@ -3,6 +3,8 @@
 /.filetwin/
 /models/
 /reports/
+/vectors.json
+*.vectors.json
 *.onnx
 *.pt
 *.pth

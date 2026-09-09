@@ -33,7 +33,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
-      - run: cargo run --locked -p filetwin-core --features bundled-sqlite --example schemas -- schemas --check
+      - run: cargo run --locked -p filetwin-core --example schemas -- schemas --check
       - run: cargo build --locked --release --workspace --bins --examples
-      - run: target/release/filetwin doctor --format json
+      - run: target/release/filetwin --help
       - run: python3 scripts/smoke.py target/release/filetwin

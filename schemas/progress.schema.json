@@ -1,0 +1,104 @@
+{
+  "$defs": {
+    "Counts": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes_hashed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bytes_read": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_hits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_discovered": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_failed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_processed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_ready": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_skipped": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "vectors_encoded": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "files_discovered",
+        "files_processed",
+        "files_ready",
+        "files_failed",
+        "files_skipped",
+        "vectors_encoded",
+        "cache_hits",
+        "bytes_read",
+        "bytes_hashed"
+      ],
+      "type": "object"
+    },
+    "Stage": {
+      "enum": [
+        "discovering",
+        "encoding",
+        "completed",
+        "cancelled"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "counts": {
+      "$ref": "#/$defs/Counts"
+    },
+    "elapsed_seconds": {
+      "format": "double",
+      "type": "number"
+    },
+    "stage": {
+      "$ref": "#/$defs/Stage"
+    }
+  },
+  "required": [
+    "stage",
+    "counts",
+    "elapsed_seconds"
+  ],
+  "title": "Progress",
+  "type": "object"
+}

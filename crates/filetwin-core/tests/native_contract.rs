@@ -1,248 +1,377 @@
-//! Test the host/worker boundary without installing any native models.
+//! Host/worker contracts with deterministic disposable workers; no model downloads.
 use filetwin_core::{
-    Catalog, Engine, ErrorCode, HostServices,
+    Encoder, ErrorCode,
     api::*,
     profile,
     worker_protocol::{Encoded, Response, VERSION},
+    write_vectors,
 };
 use serde_json::json;
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-fn script(path: &Path, body: &str) {
-    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+struct Fixture {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+    input: PathBuf,
+    config: EncoderConfig,
 }
-
-fn config(tmp: &Path, worker_body: &str) -> EngineConfig {
-    let mut config = EngineConfig::new(tmp.join("data"));
-    let worker = tmp.join("worker");
-    script(&worker, worker_body);
-    let dummy = tmp.join("library");
-    fs::write(&dummy, []).unwrap();
-    fs::create_dir_all(&config.model_dir).unwrap();
-    fs::write(config.model_dir.join(profile::SSCD_MODEL_FILE), []).unwrap();
-    config.runtime = RuntimeConfig {
-        worker_path: Some(worker.clone()),
-        ffmpeg_path: Some(worker.clone()),
-        ffprobe_path: Some(worker),
-        onnxruntime_path: Some(dummy.clone()),
-        pdfium_path: Some(dummy),
-        ..RuntimeConfig::default()
-    };
-    config
+impl Fixture {
+    fn new(body: impl FnOnce(&Path) -> String) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let input = root.join("input");
+        fs::create_dir(&input).unwrap();
+        let mut config = EncoderConfig::new(root.join("models"), root.join("staging"));
+        fs::create_dir(&config.model_dir).unwrap();
+        fs::write(config.model_dir.join(profile::SSCD_MODEL_FILE), []).unwrap();
+        let worker = root.join("worker");
+        fs::write(&worker, format!("#!/bin/sh\n{}\n", body(&root))).unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
+        let library = root.join("library");
+        fs::write(&library, []).unwrap();
+        config.runtime = RuntimeConfig {
+            worker_path: Some(worker.clone()),
+            ffmpeg_path: Some(worker.clone()),
+            ffprobe_path: Some(worker),
+            onnxruntime_path: Some(library.clone()),
+            pdfium_path: Some(library),
+            ..RuntimeConfig::default()
+        };
+        response(&root.join("response.json"), "image", 512);
+        Self {
+            _temp: temp,
+            root,
+            input,
+            config,
+        }
+    }
+    fn images(&self, n: u8) {
+        for i in 0..n {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.push(i);
+            fs::write(self.input.join(format!("{i}.png")), bytes).unwrap();
+        }
+    }
+    fn run(&self) -> VectorFile {
+        Encoder::new(self.config.clone())
+            .unwrap()
+            .encode(
+                &EncodeRequest::new(&self.input),
+                &CancellationToken::default(),
+                |_| {},
+            )
+            .unwrap()
+    }
+    fn clean(&self) {
+        assert_eq!(fs::read_dir(&self.config.temp_dir).unwrap().count(), 0);
+    }
 }
-
 fn response(path: &Path, family: &str, dimensions: usize) {
     let mut vector = vec![0.0; dimensions];
     vector[0] = 1.0;
-    let result = Response {
-        version: VERSION,
-        result: Ok(Encoded {
-            family: family.into(),
-            format: "fixture".into(),
-            vector,
-            extraction: json!({"fixture":true}),
-        }),
-    };
-    fs::write(path, serde_json::to_vec(&result).unwrap()).unwrap();
-}
-
-#[test]
-fn mixed_dimensions_profiles_cache_and_frozen_comparison() {
-    let tmp = tempfile::tempdir().unwrap();
-    let tmp = tmp.path().canonicalize().unwrap();
-    response(&tmp.join("image.json"), "image", 512);
-    response(&tmp.join("video.json"), "video", 512);
-    let cfg = config(
-        &tmp,
-        &format!(
-            "while IFS= read -r request; do\ncase \"$request\" in *'\"format\":\"media\"'*) /bin/cat '{}' ;; *) /bin/cat '{}' ;; esac\nprintf '\\n'\ndone",
-            tmp.join("video.json").display(),
-            tmp.join("image.json").display()
-        ),
-    );
-    let root = tmp.join("input");
-    fs::create_dir(&root).unwrap();
-    for i in 0..2 {
-        fs::write(root.join(format!("{i}.txt")), "identical text\n").unwrap();
-        fs::write(root.join(format!("{i}.png")), b"\x89PNG\r\n\x1a\n").unwrap();
-        fs::write(root.join(format!("{i}.mp4")), b"\0\0\0\x18ftypisom").unwrap();
-    }
-    let engine = Engine::open(cfg, HostServices::default()).unwrap();
-    let request = JobRequest::experimental_scan([root.clone()], 0.95);
-    let a = engine.submit(request.clone()).unwrap().wait().unwrap();
-    assert_eq!(a.counts.files_ready, 6, "{a:?}");
-    assert_eq!(a.counts.pairs_compared, 3);
-    assert_eq!(a.counts.similar_pairs, 3);
-    assert_eq!(a.counts.groups, 3);
-    let b = engine.submit(request.clone()).unwrap().wait().unwrap();
-    assert_eq!((b.counts.cache_hits, b.counts.bytes_read), (6, 0));
-    fs::remove_dir_all(root).unwrap();
-    let compare = JobRequest {
-        operation: Operation::Compare,
-        snapshot_id: a.snapshot_id.clone(),
-        matching: request.matching,
-        ..JobRequest::default()
-    };
-    let c = engine.submit(compare.clone()).unwrap().wait().unwrap();
-    assert_eq!(c.counts.similar_pairs, 3);
-    assert_eq!(c.counts.bytes_read, 0);
-    let mut incomplete = compare;
-    incomplete
-        .matching
-        .as_mut()
-        .unwrap()
-        .threshold_overrides
-        .remove(&profile::image_profile().profile_id);
-    assert!(matches!(engine.submit(incomplete), Err(e) if e.code == ErrorCode::ThresholdRequired));
-    let groups = Catalog::open_read_only(tmp.join("data"))
-        .unwrap()
-        .results(ResultsQuery {
-            run_id: c.run_id,
-            kind: "groups".into(),
-            ..ResultsQuery::default()
+    fs::write(
+        path,
+        serde_json::to_vec(&Response {
+            version: VERSION,
+            result: Ok(Encoded {
+                family: family.into(),
+                format: "fixture".into(),
+                vector,
+                extraction: json!({"fixture":true}),
+            }),
         })
-        .unwrap();
-    let families: std::collections::BTreeSet<_> = groups
-        .items
-        .iter()
-        .map(|g| g["family"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        families,
-        std::collections::BTreeSet::from(["image", "text", "video"])
-    );
+        .unwrap(),
+    )
+    .unwrap();
 }
-
-#[test]
-fn matrices_keep_incompatible_profiles_null_even_when_dimensions_match() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
-    response(&root.join("image.json"), "image", 512);
-    response(&root.join("video.json"), "video", 512);
-    let cfg = config(
-        &root,
-        &format!(
-            "while IFS= read -r request; do\ncase \"$request\" in *'\"format\":\"media\"'*) /bin/cat '{}' ;; *) /bin/cat '{}' ;; esac\nprintf '\\n'\ndone",
-            root.join("video.json").display(),
-            root.join("image.json").display()
-        ),
-    );
-    let input = root.join("input");
-    fs::create_dir(&input).unwrap();
-    fs::write(input.join("image.png"), b"\x89PNG\r\n\x1a\n").unwrap();
-    fs::write(input.join("video.mp4"), b"\0\0\0\x18ftypisom").unwrap();
-    let engine = Engine::open(cfg, HostServices::default()).unwrap();
-    let summary = engine
-        .submit(JobRequest::experimental_scores([input]))
-        .unwrap()
-        .wait()
-        .unwrap();
-    assert_eq!(summary.counts.files_ready, 2, "{summary:?}");
-    let matrix = Catalog::open_read_only(root.join("data"))
-        .unwrap()
-        .matrix(MatrixQuery::new(summary.run_id.unwrap()))
-        .unwrap();
-    assert_eq!(
-        matrix.scores,
-        vec![vec![Some(1.0), None], vec![None, Some(1.0)]]
-    );
-    assert_eq!(
-        matrix.unavailable_reasons[0][1],
-        Some(MatrixUnavailable::IncompatibleProfile)
-    );
-    assert_eq!(
-        matrix.unavailable_reasons[1][0],
-        Some(MatrixUnavailable::IncompatibleProfile)
-    );
+fn serve(root: &Path) -> String {
+    format!(
+        "while IFS= read -r request; do /bin/cat '{}'; printf '\\n'; done",
+        root.join("response.json").display()
+    )
 }
-
-#[test]
-fn malformed_worker_output_is_a_file_failure_and_does_not_stop_text() {
-    let temp = tempfile::tempdir().unwrap();
-    let tmp = temp.path().canonicalize().unwrap();
-    let cfg = config(&tmp, "printf 'not a protocol response'");
-    let image = tmp.join("bad.png");
-    fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
-    let text = tmp.join("good.txt");
-    fs::write(&text, "still processes text").unwrap();
-    let engine = Engine::open(cfg, HostServices::default()).unwrap();
-    let summary = engine
-        .submit(JobRequest::experimental_scan([image, text], 0.95))
-        .unwrap()
-        .wait()
-        .unwrap();
-    assert_eq!(
-        (summary.counts.files_ready, summary.counts.files_failed),
-        (1, 1)
-    );
-    assert_eq!(summary.completeness.source_coverage, "partial");
-    let errors = Catalog::open_read_only(tmp.join("data"))
-        .unwrap()
-        .results(ResultsQuery {
-            run_id: summary.run_id,
-            kind: "errors".into(),
-            ..ResultsQuery::default()
-        })
-        .unwrap();
-    assert_eq!(errors.items[0]["code"], "worker_failed");
-}
-
-#[test]
-fn cancellation_kills_native_descendants_and_removes_staging() {
-    let temp = tempfile::tempdir().unwrap();
-    let tmp = temp.path().canonicalize().unwrap();
-    let pid_file = tmp.join("decoder.pid");
-    let cfg = config(
-        &tmp,
-        &format!(
-            "/bin/sleep 120 &\nprintf '%s' \"$!\" > '{}'\nwait",
-            pid_file.display()
-        ),
-    );
-    let staging = cfg.temp_dir.clone();
-    let image = tmp.join("image.png");
-    fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
-    let engine = Engine::open(cfg, HostServices::default()).unwrap();
-    let job = engine
-        .submit(JobRequest::experimental_scan([image], 0.95))
-        .unwrap();
+fn wait_for(path: &Path) {
     let start = Instant::now();
-    while !pid_file.exists() {
-        assert!(start.elapsed() < Duration::from_secs(5));
+    while !path.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "worker did not start"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let pid: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
-    let events = job.events();
-    loop {
-        match events.recv_timeout(Duration::from_secs(5)).unwrap() {
-            JobEvent::Progress { data, .. } => {
-                assert_eq!(data["stage"], "discovery");
-                assert_eq!(data["counts"]["files_processed"], 0);
-                assert!(data["counts"]["files_total"].is_null());
-                assert!(data["counts"]["pairs_total"].is_null());
-                break;
-            }
-            JobEvent::Summary(_) => panic!("Native fixture finished before cancellation"),
-            _ => (),
+}
+
+#[test]
+fn native_workers_run_concurrently_reuse_processes_and_deduplicate_content() {
+    let f = Fixture::new(|root| {
+        fs::create_dir(root.join("starts")).unwrap();
+        format!(
+            r#"
+while IFS= read -r request; do
+    /usr/bin/touch '{root}/starts/'$$
+    attempts=0
+    while [ "$(/bin/ls '{root}/starts' | /usr/bin/wc -l)" -lt 2 ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 500 ] || exit 19
+        /bin/sleep 0.01
+    done
+    /bin/cat '{root}/response.json'
+    printf '\n'
+done
+"#,
+            root = root.display()
+        )
+    });
+    f.images(6);
+    fs::hard_link(f.input.join("0.png"), f.input.join("alias.png")).unwrap();
+    let result = f.run();
+    assert_eq!(
+        (
+            result.summary.counts.files_ready,
+            result.summary.counts.vectors_encoded,
+            result.summary.counts.cache_hits
+        ),
+        (7, 6, 1),
+        "{:?}",
+        result.summary
+    );
+    assert_eq!(fs::read_dir(f.root.join("starts")).unwrap().count(), 2);
+    assert!(
+        result
+            .files
+            .iter()
+            .all(|f| f.vector.as_ref().unwrap().len() == 512)
+    );
+    f.clean();
+}
+
+#[test]
+fn a_crashed_worker_is_replaced_for_the_next_file() {
+    let mut f = Fixture::new(|root| {
+        format!(
+            r#"
+while IFS= read -r request; do
+    if [ ! -e '{root}/crashed' ]; then /usr/bin/touch '{root}/crashed'; exit 17; fi
+    /bin/cat '{root}/response.json'
+    printf '\n'
+done
+"#,
+            root = root.display()
+        )
+    });
+    f.config.workers = 1;
+    f.images(3);
+    let result = f.run();
+    assert_eq!(
+        (
+            result.summary.counts.files_ready,
+            result.summary.counts.files_failed
+        ),
+        (2, 1)
+    );
+    assert_eq!(
+        result.files[0].error.as_ref().unwrap().code,
+        ErrorCode::WorkerFailed
+    );
+    assert!(result.files[0].file_id.is_some());
+    f.clean();
+}
+
+#[test]
+fn malformed_oversized_and_incompatible_worker_results_do_not_stop_text() {
+    for kind in [
+        "malformed",
+        "oversized",
+        "version",
+        "dimensions",
+        "family",
+        "zero_vector",
+    ] {
+        let f = Fixture::new(|root| match kind {
+            "malformed" => "printf 'not JSON\\n'".into(),
+            "oversized" => "/usr/bin/head -c 1048577 /dev/zero".into(),
+            _ => serve(root),
+        });
+        if matches!(kind, "dimensions" | "family") {
+            response(
+                &f.root.join("response.json"),
+                if kind == "family" { "audio" } else { "image" },
+                4096,
+            );
         }
+        if matches!(kind, "version" | "zero_vector") {
+            let path = f.root.join("response.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if kind == "version" {
+                value["version"] = json!(VERSION - 1);
+            } else {
+                value["result"]["Ok"]["vector"] = json!(vec![0.0; 512]);
+            }
+            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        f.images(1);
+        fs::write(f.input.join("text.txt"), "still encodes complete text").unwrap();
+        let result = f.run();
+        assert_eq!(
+            (
+                result.summary.counts.files_ready,
+                result.summary.counts.files_failed
+            ),
+            (1, 1),
+            "{kind}"
+        );
+        assert!(
+            result.files[0].file_id.is_some() && result.files[0].vector.is_none(),
+            "{kind}"
+        );
+        assert_eq!(
+            result.files[0].error.as_ref().unwrap().code,
+            ErrorCode::WorkerFailed,
+            "{kind}"
+        );
+        f.clean();
     }
-    job.cancel();
-    let summary = job.wait().unwrap();
-    assert_eq!(summary.status, "cancelled");
-    assert_eq!(summary.counts.files_ready, 0);
-    assert_eq!(summary.counts.files_processed, 0);
-    assert_eq!(summary.counts.files_total, None);
-    assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
-    // A killed descendant can be briefly visible as a zombie until the system
-    // reaper observes it. It must never continue running after cancellation.
+}
+
+#[test]
+fn a_source_changed_during_native_encoding_loses_id_and_vector() {
+    let f = Fixture::new(|root| {
+        format!(
+            r#"
+while IFS= read -r request; do
+    /usr/bin/touch '{root}/started'
+    while [ ! -e '{root}/release' ]; do /bin/sleep 0.01; done
+    /bin/cat '{root}/response.json'
+    printf '\n'
+done
+"#,
+            root = root.display()
+        )
+    });
+    f.images(1);
+    let input = f.input.clone();
+    let config = f.config.clone();
+    let thread = std::thread::spawn(move || {
+        Encoder::new(config)
+            .unwrap()
+            .encode(
+                &EncodeRequest::new(input),
+                &CancellationToken::default(),
+                |_| {},
+            )
+            .unwrap()
+    });
+    wait_for(&f.root.join("started"));
+    fs::write(f.input.join("0.png"), b"\x89PNG\r\n\x1a\nchanged").unwrap();
+    fs::write(f.root.join("release"), []).unwrap();
+    let result = thread.join().unwrap();
+    assert_eq!(result.summary.counts.files_failed, 1);
+    assert!(result.files[0].file_id.is_none() && result.files[0].vector.is_none());
+    assert_eq!(
+        result.files[0].error.as_ref().unwrap().code,
+        ErrorCode::SourceChanged
+    );
+    f.clean();
+}
+
+#[test]
+fn cache_reuses_native_vectors_without_runtime_and_separates_backends() {
+    let f = Fixture::new(serve);
+    f.images(2);
+    let original = f.run();
+    let saved = f.root.join("vectors.json");
+    write_vectors(&saved, &original).unwrap();
+    let mut config = f.config.clone();
+    config.runtime = RuntimeConfig::default();
+    let mut request = EncodeRequest::new(&f.input);
+    request.vectors_file = Some(saved);
+    let cached = Encoder::new(config.clone())
+        .unwrap()
+        .encode(&request, &CancellationToken::default(), |_| {})
+        .unwrap();
+    assert_eq!(
+        (
+            cached.summary.counts.cache_hits,
+            cached.summary.counts.vectors_encoded
+        ),
+        (2, 0)
+    );
+    assert_eq!(cached.summary.counts.bytes_hashed, 18);
+    config.backend = profile::Backend::Coreml;
+    let different = Encoder::new(config)
+        .unwrap()
+        .encode(&request, &CancellationToken::default(), |_| {})
+        .unwrap();
+    assert_eq!(
+        (
+            different.summary.counts.cache_hits,
+            different.summary.counts.files_failed
+        ),
+        (0, 2)
+    );
+    assert!(
+        different
+            .files
+            .iter()
+            .all(|f| f.error.as_ref().unwrap().code == ErrorCode::RuntimeUnavailable)
+    );
+}
+
+#[test]
+fn staging_allowance_is_shared_and_oversized_files_still_get_an_id() {
+    let mut f = Fixture::new(serve);
+    f.images(3);
+    f.config.staging_bytes = 2 * filetwin_core::worker_protocol::MAX_RESPONSE as u64 + 9;
+    let good = f.run();
+    assert_eq!(good.summary.counts.files_ready, 3);
+    f.config.staging_bytes = 1;
+    let limited = f.run();
+    assert_eq!(limited.summary.counts.files_failed, 3);
+    assert_eq!(limited.summary.counts.bytes_hashed, 27);
+    assert!(limited.files.iter().all(|f| f.file_id.is_some()
+        && f.vector.is_none()
+        && f.error.as_ref().unwrap().code == ErrorCode::ResourceBudgetTooSmall));
+    f.clean();
+}
+
+#[test]
+fn cancellation_kills_worker_descendants_and_cleans_staging() {
+    let f = Fixture::new(|root| {
+        format!(
+            "/bin/sleep 120 &\nprintf '%s' \"$!\" > '{}/decoder.pid'\nwait",
+            root.display()
+        )
+    });
+    f.images(1);
+    let token = CancellationToken::default();
+    let other = token.clone();
+    let input = f.input.clone();
+    let config = f.config.clone();
+    let thread = std::thread::spawn(move || {
+        Encoder::new(config)
+            .unwrap()
+            .encode(&EncodeRequest::new(input), &other, |_| {})
+            .unwrap()
+    });
+    wait_for(&f.root.join("decoder.pid"));
+    let pid: i32 = fs::read_to_string(f.root.join("decoder.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    token.cancel();
+    let result = thread.join().unwrap();
+    assert_eq!(result.exit_code(), 130);
+    assert_eq!(result.summary.counts.files_processed, 0);
+    assert!(!result.complete);
+    f.clean();
     for _ in 0..100 {
-        // SAFETY: signal zero only checks process existence, without signaling it.
+        // SAFETY: signal zero only checks whether this disposable process exists.
         if unsafe { libc::kill(pid, 0) } != 0 {
             return;
         }
@@ -252,244 +381,5 @@ fn cancellation_kills_native_descendants_and_removes_staging() {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("Native decoder still running after cancellation");
-}
-
-#[test]
-fn experimental_profiles_reject_unknown_families_and_mismatched_thresholds() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("a.txt");
-    fs::write(&path, "hello").unwrap();
-    let engine = Engine::open(
-        EngineConfig::new(tmp.path().join("data")),
-        HostServices::default(),
-    )
-    .unwrap();
-    let mut r = JobRequest::experimental_scan([path], 0.95);
-    r.families = Some(vec!["image".into()]);
-    assert!(matches!(engine.submit(r.clone()), Err(e) if e.code == ErrorCode::InvalidRequest));
-    r.families = None;
-    r.profiles
-        .as_mut()
-        .unwrap()
-        .insert("text".into(), profile::image_profile().profile_id);
-    assert!(matches!(engine.submit(r), Err(e) if e.code == ErrorCode::InvalidRequest));
-}
-
-#[test]
-fn known_digests_survive_profile_changes_and_vector_refresh() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("input");
-    fs::create_dir(&root).unwrap();
-    for name in ["a.txt", "b.md"] {
-        fs::write(root.join(name), "The same original bytes.").unwrap();
-    }
-    let engine = Engine::open(
-        EngineConfig::new(temp.path().join("data")),
-        HostServices::default(),
-    )
-    .unwrap();
-    let mut old = JobRequest::text_scan([root.clone()], 0.95);
-    old.exact_duplicates = Some(ExactDuplicates::Compute);
-    assert_eq!(
-        engine
-            .submit(old)
-            .unwrap()
-            .wait()
-            .unwrap()
-            .counts
-            .exact_pairs,
-        1
-    );
-    let mut modern = JobRequest::experimental_scan([root], 0.95);
-    let changed = engine.submit(modern.clone()).unwrap().wait().unwrap();
-    assert_eq!(changed.counts.vectors_encoded, 2);
-    assert_eq!(changed.counts.bytes_hashed, 0);
-    assert_eq!(changed.counts.exact_pairs, 1);
-    modern.cache = Some(Cache {
-        mode: CacheMode::Refresh,
-        ..Cache::default()
-    });
-    let refreshed = engine.submit(modern).unwrap().wait().unwrap();
-    assert_eq!(refreshed.counts.vectors_encoded, 2);
-    assert_eq!(refreshed.counts.bytes_hashed, 0);
-    assert_eq!(refreshed.counts.exact_pairs, 1);
-}
-
-#[test]
-fn native_pool_runs_concurrently_reuses_processes_and_collapses_hardlinks() {
-    let temp = tempfile::tempdir().unwrap();
-    let tmp = temp.path().canonicalize().unwrap();
-    let starts = tmp.join("starts");
-    fs::create_dir(&starts).unwrap();
-    response(&tmp.join("response.json"), "image", 512);
-    // Neither first request can finish until both workers have received work.
-    // This asserts concurrency without relying on a performance timing cutoff.
-    let cfg = config(
-        &tmp,
-        &format!(
-            r#"
-while IFS= read -r request; do
-    /usr/bin/touch '{starts}/'$$
-    attempts=0
-    while [ "$(/bin/ls '{starts}' | /usr/bin/wc -l)" -lt 2 ]; do
-        attempts=$((attempts + 1))
-        [ "$attempts" -lt 500 ] || exit 19
-        /bin/sleep 0.01
-    done
-    /bin/cat '{response}'
-    printf '\n'
-done
-"#,
-            starts = starts.display(),
-            response = tmp.join("response.json").display()
-        ),
-    );
-    let staging = cfg.temp_dir.clone();
-    let input = tmp.join("input");
-    fs::create_dir(&input).unwrap();
-    for i in 0..6 {
-        fs::write(input.join(format!("{i}.png")), b"\x89PNG\r\n\x1a\n").unwrap();
-    }
-    let alias = tmp.join("alias.png");
-    fs::hard_link(input.join("0.png"), &alias).unwrap();
-    let engine = Engine::open(cfg, HostServices::default()).unwrap();
-    let mut request = JobRequest::experimental_scores([input, alias]);
-    request.limits = Some(Limits {
-        inference_workers: Some(2),
-        ..Limits::default()
-    });
-    let summary = engine.submit(request.clone()).unwrap().wait().unwrap();
-    assert_eq!(summary.status, "completed", "{summary:?}");
-    assert_eq!(
-        (
-            summary.counts.files_ready,
-            summary.counts.locations,
-            summary.counts.vectors_encoded
-        ),
-        (6, 7, 6)
-    );
-    assert_eq!(
-        fs::read_dir(starts).unwrap().count(),
-        2,
-        "Processes should be reused"
-    );
-    assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
-    let cached = engine.submit(request).unwrap().wait().unwrap();
-    assert_eq!((cached.counts.cache_hits, cached.counts.bytes_read), (6, 0));
-}
-
-#[test]
-fn a_crashed_native_process_is_replaced_for_the_next_file() {
-    let temp = tempfile::tempdir().unwrap();
-    let tmp = temp.path().canonicalize().unwrap();
-    response(&tmp.join("response.json"), "image", 512);
-    let cfg = config(
-        &tmp,
-        &format!(
-            r#"
-while IFS= read -r request; do
-    if [ ! -e '{marker}' ]; then
-        /usr/bin/touch '{marker}'
-        exit 17
-    fi
-    /bin/cat '{response}'
-    printf '\n'
-done
-"#,
-            marker = tmp.join("crashed").display(),
-            response = tmp.join("response.json").display()
-        ),
-    );
-    let input = tmp.join("input");
-    fs::create_dir(&input).unwrap();
-    for i in 0..3 {
-        fs::write(input.join(format!("{i}.png")), b"\x89PNG\r\n\x1a\n").unwrap();
-    }
-    let engine = Engine::open(cfg, HostServices::default()).unwrap();
-    let mut request = JobRequest::experimental_scores([input]);
-    request.limits = Some(Limits {
-        inference_workers: Some(1),
-        ..Limits::default()
-    });
-    let summary = engine.submit(request).unwrap().wait().unwrap();
-    assert_eq!(
-        (summary.counts.files_ready, summary.counts.files_failed),
-        (2, 1),
-        "{summary:?}"
-    );
-    assert_eq!(summary.counts.files_processed, 3);
-    assert_eq!(summary.counts.files_total, Some(3));
-}
-
-#[test]
-fn a_source_changed_while_a_native_request_is_pending_is_not_published() {
-    let temp = tempfile::tempdir().unwrap();
-    let tmp = temp.path().canonicalize().unwrap();
-    response(&tmp.join("response.json"), "image", 512);
-    let marker = tmp.join("encoding");
-    let release = tmp.join("release");
-    let cfg = config(
-        &tmp,
-        &format!(
-            r#"
-while IFS= read -r request; do
-    /usr/bin/touch '{marker}'
-    while [ ! -e '{release}' ]; do /bin/sleep 0.01; done
-    /bin/cat '{response}'
-    printf '\n'
-done
-"#,
-            marker = marker.display(),
-            release = release.display(),
-            response = tmp.join("response.json").display()
-        ),
-    );
-    let source = tmp.join("image.png");
-    fs::write(&source, b"\x89PNG\r\n\x1a\n").unwrap();
-    let engine = Engine::open(cfg, HostServices::default()).unwrap();
-    let job = engine
-        .submit(JobRequest::experimental_scores([source.clone()]))
-        .unwrap();
-    let start = Instant::now();
-    while !marker.exists() {
-        assert!(start.elapsed() < Duration::from_secs(5));
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    fs::write(source, b"\x89PNG\r\n\x1a\nchanged").unwrap();
-    fs::write(release, []).unwrap();
-    let summary = job.wait().unwrap();
-    assert_eq!(
-        (summary.counts.files_ready, summary.counts.files_failed),
-        (0, 1),
-        "{summary:?}"
-    );
-    assert_eq!(summary.counts.vectors_encoded, 0);
-}
-
-#[test]
-fn accelerated_profiles_keep_legacy_ids_and_separate_backends() {
-    assert_eq!(
-        profile::image_profile_v2().profile_id,
-        "sha256:88a7383952aabd98b9bc41e66b355fc569e9070697040026e4476db04408700b"
-    );
-    assert_eq!(
-        profile::video_profile_v1().profile_id,
-        "sha256:b9b098920072811527446fcf68330b717817561f3eae28012410dfbebb2fd93b"
-    );
-    let mut ids = std::collections::BTreeSet::new();
-    for backend in [
-        profile::Backend::Reference,
-        profile::Backend::Cpu,
-        profile::Backend::Coreml,
-        profile::Backend::Cuda,
-    ] {
-        for p in profile::experimental_profiles_for(backend)
-            .into_iter()
-            .filter(|p| p.requires_model)
-        {
-            assert!(ids.insert(p.profile_id.clone()));
-            assert_eq!(profile::inference_backend(&p.profile_id).unwrap(), backend);
-        }
-    }
+    panic!("Decoder still running after cancellation");
 }

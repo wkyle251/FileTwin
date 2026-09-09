@@ -77,7 +77,7 @@ pub(crate) fn vector_bytes(vector: &[f32]) -> Vec<u8> {
 pub(crate) fn decode_vector(bytes: &[u8], dimensions: usize) -> crate::Result<Vec<f32>> {
     if bytes.len() != dimensions * 4 {
         return Err(crate::Error::new(
-            crate::ErrorCode::DatabaseCorrupt,
+            crate::ErrorCode::InvalidVectorFile,
             "vector",
             "Invalid vector byte length",
         ));
@@ -91,7 +91,7 @@ pub(crate) fn decode_vector(bytes: &[u8], dimensions: usize) -> crate::Result<Ve
     let norm: f64 = v.iter().map(|x| f64::from(*x).powi(2)).sum();
     if !norm.is_finite() || (norm - 1.0).abs() > 1e-5 {
         return Err(crate::Error::new(
-            crate::ErrorCode::DatabaseCorrupt,
+            crate::ErrorCode::InvalidVectorFile,
             "vector",
             "Vector has invalid components or normalization",
         ));
@@ -372,22 +372,6 @@ pub fn find(id: &str) -> crate::Result<Profile> {
                 "Profile is unavailable in this build",
             )
         })
-}
-
-pub(crate) fn validate_selection(
-    selected: &std::collections::BTreeMap<String, String>,
-) -> crate::Result<()> {
-    if selected.is_empty() {
-        return Err(crate::Error::invalid("Select at least one profile"));
-    }
-    for (family, id) in selected {
-        if find(id)?.family != *family {
-            return Err(crate::Error::invalid(
-                "Profile does not belong to the selected family",
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[doc(hidden)]

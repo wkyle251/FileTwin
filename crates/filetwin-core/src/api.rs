@@ -1,27 +1,23 @@
-//! Versioned public input/output types. Optional request fields preserve whether
-//! callers supplied them, so operation validation runs before defaults resolve.
-
-use crate::{Error, ErrorCode, Result, profile};
+//! Small typed interface shared by the CLI, Rust hosts and portable vector files.
+use crate::{Error, ErrorCode, Result, profile::Backend};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, de};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fmt, os::unix::ffi::OsStringExt, path::PathBuf};
+use std::{
+    os::unix::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
+pub const VECTOR_FILE_FORMAT: &str = "filetwin-vectors";
 pub const SCHEMA_VERSION: u32 = 1;
-pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_VECTOR_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
-pub struct EngineConfig {
-    pub data_dir: PathBuf,
-    pub model_dir: PathBuf,
-    pub temp_dir: PathBuf,
-    pub runtime: RuntimeConfig,
-}
-
-/// Explicit paths for native decoding. The library never searches PATH, reads
-/// environment configuration, downloads models, or installs signal handlers.
+/// The host provides native paths. The library never searches PATH or downloads assets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -30,13 +26,10 @@ pub struct RuntimeConfig {
     pub ffprobe_path: Option<PathBuf>,
     pub onnxruntime_path: Option<PathBuf>,
     pub pdfium_path: Option<PathBuf>,
-    /// CPU threads per native inference process; reference profiles always use one.
     pub inference_threads: u32,
     pub cuda_device_id: i32,
-    /// Explicit CUDA/cuDNN search directories; never read from the host environment.
     pub cuda_library_dirs: Vec<PathBuf>,
 }
-
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -52,1089 +45,200 @@ impl Default for RuntimeConfig {
     }
 }
 
-impl EngineConfig {
-    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
-        let data_dir = data_dir.into();
+#[derive(Debug, Clone)]
+pub struct EncoderConfig {
+    pub model_dir: PathBuf,
+    pub temp_dir: PathBuf,
+    pub runtime: RuntimeConfig,
+    pub backend: Backend,
+    pub workers: usize,
+    /// Shared native admission allowance, not a hard total RSS/GPU memory ceiling.
+    pub memory_bytes: u64,
+    /// Maximum simultaneous private source copies, including protocol reserves.
+    pub staging_bytes: u64,
+}
+impl EncoderConfig {
+    pub fn new(model_dir: impl Into<PathBuf>, temp_dir: impl Into<PathBuf>) -> Self {
         Self {
-            model_dir: data_dir.join("models"),
-            temp_dir: data_dir.join("tmp"),
+            model_dir: model_dir.into(),
+            temp_dir: temp_dir.into(),
             runtime: RuntimeConfig::default(),
-            data_dir,
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Operation {
-    #[default]
-    Scan,
-    Index,
-    Compare,
-    Group,
-}
-
-impl Operation {
-    pub(crate) fn uses_saved_input(self) -> bool {
-        matches!(self, Self::Compare | Self::Group)
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PairScope {
-    #[default]
-    AllSelected,
-    WithinEachSource,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheMode {
-    #[default]
-    Reuse,
-    Refresh,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Validation {
-    #[default]
-    Fast,
-    Strict,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ExactDuplicates {
-    #[default]
-    ReuseKnown,
-    Compute,
-    Off,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RawPath {
-    pub encoding: String,
-    pub base64: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Source {
-    pub provider: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub root: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub local_path: Option<RawPath>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub connection_id: Option<String>,
-}
-
-impl Source {
-    pub fn local(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        use std::os::unix::ffi::OsStrExt;
-        Self {
-            provider: "local".into(),
-            source_id: None,
-            connection_id: None,
-            root: path.to_str().map(str::to_owned),
-            local_path: path.to_str().is_none().then(|| RawPath {
-                encoding: "posix_bytes".into(),
-                base64: STANDARD.encode(path.as_os_str().as_bytes()),
-            }),
-        }
-    }
-
-    pub fn path(&self) -> Result<PathBuf> {
-        let path = match (&self.root, &self.local_path) {
-            (Some(root), None) => PathBuf::from(root),
-            (None, Some(raw)) if raw.encoding == "posix_bytes" => {
-                let bytes = STANDARD
-                    .decode(&raw.base64)
-                    .map_err(|_| Error::invalid("Invalid path Base64"))?;
-                PathBuf::from(std::ffi::OsString::from_vec(bytes))
-            }
-            _ => {
-                return Err(Error::invalid(
-                    "Local sources need exactly one root or posix_bytes local_path",
-                ));
-            }
-        };
-        if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
-            return Err(Error::invalid(
-                "Source paths must be absolute and contain no NUL bytes",
-            ));
-        }
-        Ok(path)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Filters {
-    #[serde(default)]
-    pub include_globs: Vec<String>,
-    #[serde(default)]
-    pub exclude_globs: Vec<String>,
-    #[serde(default)]
-    pub extensions: Vec<String>,
-    #[serde(default = "yes")]
-    pub include_hidden: bool,
-    pub min_bytes: Option<u64>,
-    pub max_bytes: Option<u64>,
-}
-
-fn yes() -> bool {
-    true
-}
-
-impl Filters {
-    pub fn unrestricted() -> Self {
-        Self {
-            include_hidden: true,
-            ..Self::default()
-        }
-    }
-}
-impl Default for Filters {
-    fn default() -> Self {
-        Self {
-            include_globs: vec![],
-            exclude_globs: vec![],
-            extensions: vec![],
-            include_hidden: true,
-            min_bytes: None,
-            max_bytes: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Matching {
-    #[serde(default = "exact")]
-    pub retrieval: String,
-    #[serde(default = "all_pairs")]
-    pub grouping: String,
-    #[serde(default)]
-    pub score_retention: ScoreRetention,
-    #[serde(default)]
-    pub threshold_overrides: BTreeMap<String, f64>,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ScoreRetention {
-    #[default]
-    Matches,
-    All,
-}
-fn exact() -> String {
-    "exact".into()
-}
-fn all_pairs() -> String {
-    "all_pairs".into()
-}
-impl Default for Matching {
-    fn default() -> Self {
-        Self {
-            retrieval: exact(),
-            grouping: all_pairs(),
-            score_retention: ScoreRetention::Matches,
-            threshold_overrides: BTreeMap::new(),
-        }
-    }
-}
-
-impl Matching {
-    /// Save every compatible non-self score without thresholds or grouping.
-    pub fn all_scores() -> Self {
-        Self {
-            grouping: "none".into(),
-            score_retention: ScoreRetention::All,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn needs_thresholds(&self) -> bool {
-        self.score_retention == ScoreRetention::Matches || self.grouping == "all_pairs"
-    }
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Cache {
-    #[serde(default)]
-    pub mode: CacheMode,
-    #[serde(default)]
-    pub validation: Validation,
-    #[serde(default)]
-    pub import_sidecars: bool,
-    #[serde(default)]
-    pub export_sidecars: bool,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Limits {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staging_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub io_workers: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inference_workers: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub download_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub download_bytes_per_second: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wall_time_seconds: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct JobRequest {
-    pub schema_version: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    #[serde(default)]
-    pub operation: Operation,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sources: Option<Vec<Source>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_run_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_revision: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recursive: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub families: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profiles: Option<BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filters: Option<Filters>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pair_scope: Option<PairScope>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub matching: Option<Matching>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache: Option<Cache>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exact_duplicates: Option<ExactDuplicates>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limits: Option<Limits>,
-}
-
-impl Default for JobRequest {
-    fn default() -> Self {
-        Self {
-            schema_version: 1,
-            request_id: None,
-            operation: Operation::Scan,
-            sources: None,
-            snapshot_id: None,
-            source_run_id: None,
-            source_revision: None,
-            recursive: None,
-            families: None,
-            profiles: None,
-            filters: None,
-            pair_scope: None,
-            matching: None,
-            cache: None,
-            exact_duplicates: None,
-            limits: None,
-        }
-    }
-}
-
-impl JobRequest {
-    /// Parse bounded versioned JSON, rejecting duplicate/unknown keys and
-    /// explicitly present fields that do not belong to the selected operation.
-    pub fn from_json(bytes: &[u8]) -> Result<Self> {
-        let value: Value = parse_json(bytes)?;
-        validate_request_shape(&value)?;
-        Ok(serde_json::from_value(value)?)
-    }
-    /// Explicitly opt into the experimental text profile and an uncalibrated cutoff.
-    pub fn text_scan(paths: impl IntoIterator<Item = PathBuf>, threshold: f64) -> Self {
-        let p = profile::text_profile();
-        Self {
-            sources: Some(paths.into_iter().map(Source::local).collect()),
-            profiles: Some(BTreeMap::from([("text".into(), p.profile_id.clone())])),
-            matching: Some(Matching {
-                threshold_overrides: BTreeMap::from([(p.profile_id, threshold)]),
-                ..Matching::default()
-            }),
-            ..Self::default()
-        }
-    }
-
-    pub fn text_index(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        let mut r = Self::text_scan(paths, 0.0);
-        r.operation = Operation::Index;
-        r.matching = None;
-        r
-    }
-
-    /// Opt into the current experimental profile for each of the four families.
-    /// The caller chooses the cutoff; this is not a calibrated default.
-    pub fn experimental_scan(paths: impl IntoIterator<Item = PathBuf>, threshold: f64) -> Self {
-        Self::experimental_scan_with_backend(paths, threshold, profile::Backend::Cpu)
-    }
-
-    pub fn experimental_scan_with_backend(
-        paths: impl IntoIterator<Item = PathBuf>,
-        threshold: f64,
-        backend: profile::Backend,
-    ) -> Self {
-        let profiles = profile::experimental_profiles_for(backend);
-        Self {
-            sources: Some(paths.into_iter().map(Source::local).collect()),
-            profiles: Some(
-                profiles
-                    .iter()
-                    .map(|p| (p.family.clone(), p.profile_id.clone()))
-                    .collect(),
-            ),
-            matching: Some(Matching {
-                threshold_overrides: profiles
-                    .into_iter()
-                    .map(|p| (p.profile_id, threshold))
-                    .collect(),
-                ..Matching::default()
-            }),
-            ..Self::default()
-        }
-    }
-
-    pub fn experimental_index(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        let mut request = Self::experimental_scan(paths, 0.0);
-        request.operation = Operation::Index;
-        request.matching = None;
-        request
-    }
-
-    pub fn experimental_scores(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        let mut request = Self::experimental_index(paths);
-        request.operation = Operation::Scan;
-        request.matching = Some(Matching::all_scores());
-        request
-    }
-
-    pub fn experimental_scores_with_backend(
-        paths: impl IntoIterator<Item = PathBuf>,
-        backend: profile::Backend,
-    ) -> Self {
-        let mut request = Self::experimental_scan_with_backend(paths, 0.0, backend);
-        request.matching = Some(Matching::all_scores());
-        request
-    }
-
-    pub fn text_scores(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        let mut request = Self::text_index(paths);
-        request.operation = Operation::Scan;
-        request.matching = Some(Matching::all_scores());
-        request
-    }
-
-    pub fn group_scores(run_id: impl Into<String>, thresholds: BTreeMap<String, f64>) -> Self {
-        Self {
-            operation: Operation::Group,
-            source_run_id: Some(run_id.into()),
-            matching: Some(Matching {
-                threshold_overrides: thresholds,
-                ..Matching::default()
-            }),
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn retains_scores(&self) -> bool {
-        self.matching
-            .as_ref()
-            .is_some_and(|m| m.score_retention == ScoreRetention::All)
-    }
-
-    pub(crate) fn resolve(mut self) -> Result<Self> {
-        if self.schema_version != SCHEMA_VERSION {
-            return Err(Error::new(
-                ErrorCode::UnsupportedSchemaVersion,
-                "validation",
-                "Only schema_version 1 is supported",
-            ));
-        }
-        if self.operation != Operation::Group
-            && (self.source_run_id.is_some() || self.source_revision.is_some())
-        {
-            return Err(Error::invalid(
-                "source_run_id and source_revision are only valid for group",
-            ));
-        }
-        if self.operation.uses_saved_input() {
-            if self.sources.is_some()
-                || self.profiles.is_some()
-                || self.filters.is_some()
-                || self.families.is_some()
-                || self.cache.is_some()
-                || self.exact_duplicates.is_some()
-                || self.recursive.is_some()
-            {
-                return Err(Error::invalid(
-                    "compare and group reject discovery/encoding settings",
-                ));
-            }
-            if self.operation == Operation::Compare
-                && self.snapshot_id.as_ref().is_none_or(String::is_empty)
-            {
-                return Err(Error::invalid("compare requires snapshot_id"));
-            }
-            if self.operation == Operation::Group
-                && (self.source_run_id.as_ref().is_none_or(String::is_empty)
-                    || self.source_revision == Some(0)
-                    || self.snapshot_id.is_some())
-            {
-                return Err(Error::invalid(
-                    "group requires source_run_id, an optional positive source_revision, and no snapshot_id",
-                ));
-            }
-        } else {
-            if self.snapshot_id.is_some() {
-                return Err(Error::invalid("snapshot_id is only valid for compare"));
-            }
-            let sources = self
-                .sources
-                .as_mut()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| Error::invalid("At least one source is required"))?;
-            let mut ids = std::collections::BTreeSet::new();
-            for (i, s) in sources.iter_mut().enumerate() {
-                if s.provider != "local" {
-                    return Err(Error::new(
-                        ErrorCode::UnsupportedProvider,
-                        "validation",
-                        "Only local sources are implemented",
-                    ));
-                }
-                if s.connection_id.is_some() {
-                    return Err(Error::invalid("Local sources do not use connection_id"));
-                }
-                s.path()?;
-                let id = s
-                    .source_id
-                    .get_or_insert_with(|| format!("source_{}", i + 1));
-                if id.is_empty() || id.len() > 256 || !ids.insert(id.clone()) {
-                    return Err(Error::invalid(
-                        "Source IDs must be distinct and contain 1..256 UTF-8 bytes",
-                    ));
-                }
-            }
-            let selected = self
-                .profiles
-                .as_ref()
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::ExperimentalProfileRequired,
-                        "validation",
-                        "Explicitly select experimental profiles; the CLI provides --experimental",
-                    )
-                })?;
-            profile::validate_selection(selected)?;
-            let families: Vec<_> = selected.keys().cloned().collect();
-            if let Some(requested) = &self.families {
-                let mut requested = requested.clone();
-                requested.sort();
-                if requested != families {
-                    return Err(Error::invalid(
-                        "families must contain exactly the selected profile families, without duplicates",
-                    ));
-                }
-            }
-            self.families = Some(families);
-            self.recursive.get_or_insert(true);
-            let f = self.filters.get_or_insert_with(Filters::unrestricted);
-            if matches!((f.min_bytes,f.max_bytes),(Some(a),Some(b)) if a>b) {
-                return Err(Error::invalid("min_bytes must not exceed max_bytes"));
-            }
-            if f.extensions
-                .iter()
-                .any(|s| s.is_empty() || s.starts_with('.') || s.contains('/'))
-            {
-                return Err(Error::invalid(
-                    "Extensions must be nonempty names without a leading dot or slash",
-                ));
-            }
-            for glob in f.include_globs.iter().chain(&f.exclude_globs) {
-                crate::local::compile_glob(glob)?;
-            }
-            let cache = self.cache.get_or_insert_with(Cache::default);
-            if cache.import_sidecars || cache.export_sidecars {
-                return Err(Error::new(
-                    ErrorCode::UnsupportedCapability,
-                    "validation",
-                    "Sidecar import/export is not implemented in this preview",
-                ));
-            }
-            self.exact_duplicates
-                .get_or_insert(ExactDuplicates::ReuseKnown);
-        }
-        if self.operation == Operation::Index {
-            if self.matching.is_some() || self.pair_scope.is_some() {
-                return Err(Error::invalid("index rejects matching and pair_scope"));
-            }
-        } else {
-            if self.operation != Operation::Group {
-                self.pair_scope.get_or_insert(PairScope::AllSelected);
-            }
-            let m = self.matching.get_or_insert_with(Matching::default);
-            if m.retrieval != "exact" || !["all_pairs", "none"].contains(&m.grouping.as_str()) {
-                return Err(Error::new(
-                    ErrorCode::UnsupportedCapability,
-                    "validation",
-                    "Only exact retrieval and all_pairs or none grouping are implemented",
-                ));
-            }
-            if self.operation == Operation::Group
-                && (m.score_retention != ScoreRetention::Matches || m.grouping != "all_pairs")
-            {
-                return Err(Error::invalid(
-                    "group requires all_pairs grouping and matches score retention",
-                ));
-            }
-            if !m.needs_thresholds() && !m.threshold_overrides.is_empty() {
-                return Err(Error::invalid(
-                    "Scoring without grouping does not use thresholds",
-                ));
-            }
-            if m.threshold_overrides
-                .values()
-                .any(|v| !v.is_finite() || !(-1.0..=1.0).contains(v))
-            {
-                return Err(Error::invalid(
-                    "Thresholds must be finite numbers in [-1, 1]",
-                ));
-            }
-            if !self.operation.uses_saved_input() {
-                self.validate_thresholds(self.profiles.as_ref().expect("Selected profiles"))?;
-            }
-        }
-        let limits = self.limits.get_or_insert_with(Limits::default);
-        if self.operation.uses_saved_input()
-            && (limits.staging_bytes.is_some()
-                || limits.io_workers.is_some()
-                || limits.inference_workers.is_some()
-                || limits.download_bytes.is_some()
-                || limits.download_bytes_per_second.is_some())
-        {
-            return Err(Error::invalid(
-                "compare and group accept only memory, result, and wall-time limits",
-            ));
-        }
-        limits.memory_bytes.get_or_insert(2 * 1024 * 1024 * 1024);
-        limits.result_bytes.get_or_insert(1024 * 1024 * 1024);
-        if !self.operation.uses_saved_input() {
-            limits.staging_bytes.get_or_insert(10 * 1024 * 1024 * 1024);
-            limits.io_workers.get_or_insert(2);
-            limits.inference_workers.get_or_insert(2);
-        }
-        if [
-            limits.memory_bytes,
-            limits.staging_bytes,
-            limits.result_bytes,
-            limits.download_bytes_per_second,
-            limits.wall_time_seconds,
-        ]
-        .into_iter()
-        .flatten()
-        .any(|v| v == 0 || v > i64::MAX as u64)
-            || limits.io_workers == Some(0)
-            || limits.inference_workers == Some(0)
-        {
-            return Err(Error::invalid(
-                "Budgets and worker counts must be positive; byte budgets must fit signed 64-bit storage",
-            ));
-        }
-        if limits.memory_bytes.unwrap() < 64 * 1024 * 1024 {
-            return Err(Error::new(
-                ErrorCode::ResourceBudgetTooSmall,
-                "validation",
-                "The reference engine requires a memory budget of at least 64 MiB",
-            ));
-        }
-        let id = self
-            .request_id
-            .get_or_insert_with(|| format!("request_{}", uuid::Uuid::new_v4()));
-        if id.is_empty() || id.len() > 1024 {
-            return Err(Error::invalid(
-                "request_id must contain 1..1024 UTF-8 bytes",
-            ));
-        }
-        Ok(self)
-    }
-
-    pub(crate) fn validate_thresholds(&self, selected: &BTreeMap<String, String>) -> Result<()> {
-        profile::validate_selection(selected)?;
-        let Some(m) = &self.matching else {
-            return Ok(());
-        };
-        if !m.needs_thresholds() {
-            return Ok(());
-        }
-        if m.threshold_overrides.len() != selected.len()
-            || selected
-                .values()
-                .any(|id| !m.threshold_overrides.contains_key(id))
-        {
-            return Err(Error::new(
-                ErrorCode::ThresholdRequired,
-                "validation",
-                "Provide exactly one threshold for every selected profile (including profiles with no ready files)",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn threshold(&self, profile_id: &str) -> Result<f64> {
-        self.matching
-            .as_ref()
-            .and_then(|m| m.threshold_overrides.get(profile_id))
-            .copied()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorCode::ThresholdRequired,
-                    "matching",
-                    "Missing profile threshold",
-                )
-            })
-    }
-}
-
-/// Presence validation precedes merging defaults and typed deserialization.
-pub fn validate_request_shape(value: &Value) -> Result<()> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| Error::invalid("Processing request must be one JSON object"))?;
-    if !object.contains_key("schema_version") {
-        return Err(Error::invalid("Serialized requests require schema_version"));
-    }
-    let operation = object
-        .get("operation")
-        .and_then(Value::as_str)
-        .unwrap_or("scan");
-    if object
-        .get("limits")
-        .and_then(Value::as_object)
-        .is_some_and(|l| {
-            [
-                "memory_bytes",
-                "staging_bytes",
-                "result_bytes",
-                "io_workers",
-                "inference_workers",
-            ]
-            .iter()
-            .any(|k| l.get(*k).is_some_and(Value::is_null))
-        })
-    {
-        return Err(Error::invalid(
-            "Finite budgets and worker counts cannot be null",
-        ));
-    }
-    if ["compare", "group"].contains(&operation) {
-        if [
-            "sources",
-            "families",
-            "profiles",
-            "filters",
-            "cache",
-            "recursive",
-            "exact_duplicates",
-        ]
-        .iter()
-        .any(|k| object.contains_key(*k))
-        {
-            return Err(Error::invalid(
-                "compare and group reject discovery/encoding fields, including explicit nulls",
-            ));
-        }
-        if object
-            .get("limits")
-            .and_then(Value::as_object)
-            .is_some_and(|l| {
-                [
-                    "staging_bytes",
-                    "io_workers",
-                    "inference_workers",
-                    "download_bytes",
-                    "download_bytes_per_second",
-                ]
-                .iter()
-                .any(|k| l.contains_key(*k))
-            })
-        {
-            return Err(Error::invalid(
-                "compare and group accept only memory, result, and wall-time limits",
-            ));
-        }
-    }
-    if operation == "index"
-        && ["matching", "pair_scope"]
-            .iter()
-            .any(|k| object.contains_key(*k))
-    {
-        return Err(Error::invalid("index rejects matching and pair_scope"));
-    }
-    if operation != "compare" && object.contains_key("snapshot_id") {
-        return Err(Error::invalid("snapshot_id is only valid for compare"));
-    }
-    if operation != "group"
-        && ["source_run_id", "source_revision"]
-            .iter()
-            .any(|k| object.contains_key(*k))
-    {
-        return Err(Error::invalid(
-            "source_run_id and source_revision are only valid for group",
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Counts {
-    pub files_discovered: u64,
-    /// Inventory entries with a recorded ready, failed or excluded outcome.
-    /// Hard-linked locations share an entry; excluded entries can be non-files.
-    #[serde(default)]
-    pub files_processed: u64,
-    /// Final inventory size; unknown while discovery is incomplete.
-    #[serde(default)]
-    pub files_total: Option<u64>,
-    pub files_ready: u64,
-    pub files_failed: u64,
-    pub files_excluded: u64,
-    pub locations: u64,
-    pub vectors_encoded: u64,
-    pub cache_hits: u64,
-    pub bytes_read: u64,
-    pub bytes_hashed: u64,
-    /// Candidate pairs examined, including scope/profile skips and hash-only pairs.
-    #[serde(default)]
-    pub pairs_processed: u64,
-    /// All unordered candidate pairs in the frozen snapshot, not just vector comparisons.
-    #[serde(default)]
-    pub pairs_total: Option<u64>,
-    pub pairs_compared: u64,
-    #[serde(default)]
-    pub scores_retained: u64,
-    #[serde(default)]
-    pub scores_reused: u64,
-    /// Saved similarity scores to inspect during a group job; excludes exact-pair records.
-    #[serde(default)]
-    pub scores_total: Option<u64>,
-    pub similar_pairs: u64,
-    pub groups: u64,
-    pub exact_pairs: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Completeness {
-    pub source_coverage: String,
-    pub comparison_coverage: String,
-    pub retrieval_mode: Option<String>,
-    pub limits_reached: Vec<String>,
-    pub freshness: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct JobSummary {
-    pub job_id: String,
-    pub run_id: Option<String>,
-    pub attempt_id: u64,
-    pub status: String,
-    pub resumable: bool,
-    pub snapshot_id: Option<String>,
-    pub result_revision: Option<u64>,
-    pub scope_summary: Value,
-    pub started_at: String,
-    pub finished_at: String,
-    pub elapsed_seconds: f64,
-    pub result_bytes_used: u64,
-    pub counts: Counts,
-    pub completeness: Completeness,
-    pub error: Option<Error>,
-}
-
-impl JobSummary {
-    pub fn exit_code(&self) -> i32 {
-        if self.status == "cancelled" {
-            return self.error.as_ref().map_or(130, Error::exit_code);
-        }
-        if self.status == "failed" {
-            return self.error.as_ref().map_or(1, Error::exit_code);
-        }
-        if self.status == "checkpointed"
-            || self.completeness.source_coverage == "partial"
-            || self.completeness.comparison_coverage == "partial"
-        {
-            3
-        } else {
-            0
+            backend: Backend::Cpu,
+            workers: 2,
+            memory_bytes: 2 << 30,
+            staging_bytes: 10 << 30,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub enum JobEvent {
-    Accepted {
-        job_id: String,
-        run_id: Option<String>,
-        data: Value,
-    },
-    Progress {
-        job_id: String,
-        run_id: Option<String>,
-        data: Value,
-    },
-    Error {
-        job_id: String,
-        run_id: Option<String>,
-        error: Error,
-    },
-    Summary(Box<JobSummary>),
+pub struct EncodeRequest {
+    pub directory: PathBuf,
+    pub vectors_file: Option<PathBuf>,
+    /// Reserve an output pathname so it is not included as a source. Encoding
+    /// itself never writes the vector file; call write_vectors afterwards.
+    pub output_file: Option<PathBuf>,
+}
+impl EncodeRequest {
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            directory: directory.into(),
+            vectors_file: None,
+            output_file: None,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Envelope {
-    pub schema_version: u32,
-    pub invocation_id: String,
-    pub request_id: String,
-    pub sequence: u64,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub job_id: Option<String>,
-    pub run_id: Option<String>,
-    pub data: Value,
+#[derive(Debug, Default, Clone)]
+pub struct CancellationToken(Arc<AtomicBool>);
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(Error::new(
+                ErrorCode::Cancelled,
+                "encoding",
+                "Encoding cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Normal paths are strings. Non-UTF-8 POSIX filenames remain lossless.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum FilePath {
+    Utf8(String),
+    Bytes { encoding: String, base64: String },
+}
+impl FilePath {
+    pub fn from_path(path: &Path) -> Self {
+        match path.to_str() {
+            Some(s) => Self::Utf8(s.into()),
+            None => Self::Bytes {
+                encoding: "posix_bytes".into(),
+                base64: STANDARD.encode(path.as_os_str().as_bytes()),
+            },
+        }
+    }
+    pub fn to_path_buf(&self) -> Result<PathBuf> {
+        let bytes = match self {
+            Self::Utf8(s) => s.as_bytes().to_vec(),
+            Self::Bytes { encoding, base64 } if encoding == "posix_bytes" => STANDARD
+                .decode(base64)
+                .map_err(|_| Error::invalid("Invalid path Base64"))?,
+            _ => return Err(Error::invalid("Unknown path encoding")),
+        };
+        if bytes.contains(&0) {
+            return Err(Error::invalid("NUL in path"));
+        }
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileState {
+    Ready,
+    Failed,
+    Unsupported,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct StatusQuery {
-    pub schema_version: u32,
-    pub job_id: String,
-    pub request_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ResultsQuery {
-    pub schema_version: u32,
-    pub request_id: Option<String>,
-    pub run_id: Option<String>,
-    pub snapshot_id: Option<String>,
-    pub kind: String,
-    pub group_id: Option<String>,
+pub struct FileRecord {
+    /// Relative to VectorFile.directory. Paths are labels, never cache lookup keys.
+    pub path: FilePath,
+    /// SHA-256 of complete original bytes; identical copies share this identifier.
     pub file_id: Option<String>,
-    pub result_revision: Option<u64>,
-    pub cursor: Option<String>,
-    pub page_size: Option<u32>,
-    pub min_score: Option<f64>,
-}
-
-impl Default for ResultsQuery {
-    fn default() -> Self {
-        Self {
-            schema_version: 1,
-            request_id: None,
-            run_id: None,
-            snapshot_id: None,
-            kind: "files".into(),
-            group_id: None,
-            file_id: None,
-            result_revision: None,
-            cursor: None,
-            page_size: None,
-            min_score: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ResultPage {
-    pub snapshot_id: String,
-    pub run_id: Option<String>,
-    pub result_revision: u64,
-    pub kind: String,
-    pub items: Vec<Value>,
-    pub next_cursor: Option<String>,
-}
-
-/// A bounded rectangular view of a saved score run. Offsets are zero-based and
-/// both axes follow immutable snapshot file order (file_id order).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MatrixQuery {
-    pub schema_version: u32,
-    pub run_id: String,
-    pub result_revision: Option<u64>,
-    #[serde(default)]
-    pub row_offset: u64,
-    #[serde(default)]
-    pub column_offset: u64,
-    #[serde(default = "matrix_limit")]
-    pub row_limit: u32,
-    #[serde(default = "matrix_limit")]
-    pub column_limit: u32,
-}
-
-fn matrix_limit() -> u32 {
-    128
-}
-
-impl MatrixQuery {
-    pub fn new(run_id: impl Into<String>) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            run_id: run_id.into(),
-            result_revision: None,
-            row_offset: 0,
-            column_offset: 0,
-            row_limit: matrix_limit(),
-            column_limit: matrix_limit(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MatrixFile {
-    pub file_id: String,
-    pub vector_id: Option<String>,
-    pub locator: Source,
+    pub bytes: Option<u64>,
+    pub state: FileState,
     pub family: Option<String>,
     pub profile_id: Option<String>,
-    pub state: String,
+    pub vector: Option<Vec<f32>>,
+    pub vector_sha256: Option<String>,
+    pub reused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Error>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extraction: Option<Value>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Counts {
+    pub files_discovered: u64,
+    pub files_processed: u64,
+    pub files_total: Option<u64>,
+    pub files_ready: u64,
+    pub files_failed: u64,
+    pub files_skipped: u64,
+    pub vectors_encoded: u64,
+    pub cache_hits: u64,
+    pub bytes_read: u64,
+    pub bytes_hashed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum MatrixUnavailable {
-    FileUnavailable,
-    IncompatibleProfile,
-    OutsideScope,
-    NotComputed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MatrixPage {
-    pub snapshot_id: String,
-    pub run_id: String,
-    pub result_revision: u64,
-    pub metric: String,
-    pub score_range: [f64; 2],
-    pub total_files: u64,
-    pub row_offset: u64,
-    pub column_offset: u64,
-    pub rows: Vec<MatrixFile>,
-    pub columns: Vec<MatrixFile>,
-    pub scores: Vec<Vec<Option<f64>>>,
-    pub unavailable_reasons: Vec<Vec<Option<MatrixUnavailable>>>,
-    pub next_row_offset: Option<u64>,
-    pub next_column_offset: Option<u64>,
-    pub completeness: Completeness,
+pub enum Stage {
+    Discovering,
+    Encoding,
+    Completed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ExportRequest {
-    pub schema_version: u32,
-    pub request_id: Option<String>,
-    pub run_id: Option<String>,
-    pub snapshot_id: Option<String>,
-    pub result_revision: Option<u64>,
+pub struct Progress {
+    pub stage: Stage,
+    pub counts: Counts,
+    pub elapsed_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Summary {
+    pub counts: Counts,
+    pub elapsed_seconds: f64,
+    pub backend: Backend,
+    pub workers: usize,
+    pub cancelled: bool,
+}
+
+/// This is both the returned result and the optional cache input for another run.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VectorFile {
     pub format: String,
-    pub directory: PathBuf,
+    pub schema_version: u32,
+    pub directory: FilePath,
+    /// False on cancellation or an incomplete directory listing. Individual
+    /// decoding failures are represented in files even when traversal completes.
+    pub complete: bool,
+    pub files: Vec<FileRecord>,
+    pub summary: Summary,
 }
 
-/// Parse bounded input without allowing duplicate object keys at any depth.
-pub fn parse_json<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    if bytes.len() > MAX_REQUEST_BYTES {
-        return Err(Error::invalid("JSON input exceeds 8 MiB"));
-    }
-    let value: UniqueValue = serde_json::from_slice(bytes)?;
-    Ok(serde_json::from_value(value.0)?)
-}
-
-struct UniqueValue(Value);
-impl<'de> Deserialize<'de> for UniqueValue {
-    fn deserialize<D: de::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> de::Visitor<'de> for Visitor {
-            type Value = UniqueValue;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("JSON with unique object keys")
-            }
-            fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
-                serde_json::Number::from_f64(v)
-                    .map(|v| UniqueValue(Value::Number(v)))
-                    .ok_or_else(|| E::custom("Non-finite number"))
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueValue(v.into()))
-            }
-            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueValue(Value::Null))
-            }
-            fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
-                Ok(UniqueValue(Value::Null))
-            }
-            fn visit_seq<A: de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                let mut a = Vec::new();
-                while let Some(v) = seq.next_element::<UniqueValue>()? {
-                    a.push(v.0);
-                }
-                Ok(UniqueValue(Value::Array(a)))
-            }
-            fn visit_map<A: de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                let mut obj = serde_json::Map::new();
-                while let Some((k, v)) = map.next_entry::<String, UniqueValue>()? {
-                    if obj.insert(k.clone(), v.0).is_some() {
-                        return Err(de::Error::custom(format!("Duplicate JSON key: {k}")));
-                    }
-                }
-                Ok(UniqueValue(Value::Object(obj)))
-            }
+impl VectorFile {
+    pub fn exit_code(&self) -> i32 {
+        if self.summary.cancelled {
+            130
+        } else if !self.complete
+            || self.summary.counts.files_failed > 0
+            || self.summary.counts.files_skipped > 0
+        {
+            3
+        } else {
+            0
         }
-        deserializer.deserialize_any(Visitor)
     }
 }

@@ -1,5 +1,12 @@
 # Existing-project evaluation and architecture references
 
+Historical research note for the pre-0.2 design. The current
+[architecture](file-similarity-architecture.md) supersedes its persistence,
+matching and cloud proposals: FileTwin now returns vectors directly, optionally
+reuses one JSON file, hashes every current source, and delegates similarity
+decisions to its caller. Third-party descriptions below record the original
+review; they have not been re-evaluated as part of this interface change.
+
 Reviewed: 2026-09-08.
 Scope: the independent Rust application described in
 [the architecture](file-similarity-architecture.md).

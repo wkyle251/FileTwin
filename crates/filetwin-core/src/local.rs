@@ -1,8 +1,5 @@
-use crate::{Error, ErrorCode, Result, api::Filters, profile::digest_hex};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use globset::{GlobBuilder, GlobMatcher};
+use crate::{Error, ErrorCode, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::{
     ffi::{CStr, CString, OsString},
     fs::{File, Metadata},
@@ -166,163 +163,15 @@ impl Revision {
     pub fn key(&self) -> String {
         serde_json::to_string(self).expect("Revision is serializable")
     }
-    pub fn file_id(&self, namespace: &str) -> String {
-        let incarnation = self
-            .birth
-            .clone()
-            .unwrap_or_else(|| format!("ctime:{}:{}", self.ctime, self.ctime_ns));
-        format!(
-            "file_{}",
-            digest_hex(
-                format!("{namespace}:{}:{}:{incarnation}", self.device, self.inode).as_bytes()
-            )
-        )
-    }
-    pub fn identity_kind(&self) -> &str {
-        if self.birth.is_some() {
-            "device_inode_birthtime"
-        } else {
-            "device_inode_ctime_fallback"
-        }
-    }
 }
 
-pub(crate) fn path_bytes(path: &Path) -> &[u8] {
-    path.as_os_str().as_bytes()
-}
-pub(crate) fn from_bytes(bytes: Vec<u8>) -> PathBuf {
-    PathBuf::from(OsString::from_vec(bytes))
-}
-pub(crate) fn locator(path: &Path) -> Value {
-    match path.to_str() {
-        Some(p) => json!({"provider":"local","root":p}),
-        None => {
-            json!({"provider":"local","display_path":path.to_string_lossy(),"local_path":{"encoding":"posix_bytes","base64":STANDARD.encode(path_bytes(path))}})
-        }
-    }
-}
-pub(crate) fn location_id(path: &Path) -> String {
-    format!("location_{}", digest_hex(path_bytes(path)))
-}
-pub(crate) fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
-    if pattern.contains(['[', ']', '{', '}', '\\']) {
-        return Err(Error::invalid(
-            "The glob dialect supports only literals, *, ?, and **",
-        ));
-    }
-    Ok(GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .backslash_escape(false)
-        .build()
-        .map_err(|e| Error::invalid(e.to_string()))?
-        .compile_matcher())
-}
-pub(crate) struct FilterSet {
-    include: Vec<GlobMatcher>,
-    exclude: Vec<GlobMatcher>,
-    filters: Filters,
-}
-impl FilterSet {
-    pub fn new(filters: Filters) -> Result<Self> {
-        Ok(Self {
-            include: filters
-                .include_globs
-                .iter()
-                .map(|g| compile_glob(g))
-                .collect::<Result<_>>()?,
-            exclude: filters
-                .exclude_globs
-                .iter()
-                .map(|g| compile_glob(g))
-                .collect::<Result<_>>()?,
-            filters,
-        })
-    }
-    pub fn hidden_excluded(&self, path: &Path) -> bool {
-        !self.filters.include_hidden
-            && path
-                .components()
-                .any(|c| c.as_os_str().as_bytes().starts_with(b"."))
-    }
-    pub fn matches(&self, relative: &Path, bytes: u64) -> Result<bool> {
-        if self.hidden_excluded(relative)
-            || self.filters.min_bytes.is_some_and(|v| bytes < v)
-            || self.filters.max_bytes.is_some_and(|v| bytes > v)
-        {
-            return Ok(false);
-        }
-        if (!self.include.is_empty()
-            || !self.exclude.is_empty()
-            || !self.filters.extensions.is_empty())
-            && relative.to_str().is_none()
-        {
-            return Err(Error::new(
-                ErrorCode::UnsupportedCapability,
-                "filter",
-                "Name filter cannot evaluate a non-Unicode path losslessly",
-            ));
-        }
-        if self.exclude.iter().any(|g| g.is_match(relative))
-            || (!self.include.is_empty() && !self.include.iter().any(|g| g.is_match(relative)))
-        {
-            return Ok(false);
-        }
-        Ok(self.filters.extensions.is_empty()
-            || relative
-                .extension()
-                .and_then(|v| v.to_str())
-                .is_some_and(|ext| {
-                    self.filters
-                        .extensions
-                        .iter()
-                        .any(|v| v.eq_ignore_ascii_case(ext))
-                }))
-    }
-}
-
-pub(crate) fn excluded_artifact(path: &Path, dirs: &[PathBuf]) -> bool {
-    dirs.iter().any(|d| path.starts_with(d))
-        || path.file_name().is_some_and(|n| {
-            n.as_bytes().ends_with(b".filetwin.json")
-                || n.as_bytes().starts_with(b".filetwin-export-")
-        })
-        || is_report_directory(path)
-}
-
-fn is_report_directory(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(file) = open_secure(&path.join("filetwin-export.json")) else {
-        return false;
-    };
-    let mut bytes = Vec::new();
-    if file.take(65537).read_to_end(&mut bytes).is_err() || bytes.len() > 65536 {
-        return false;
-    }
-    serde_json::from_slice::<Value>(&bytes)
-        .is_ok_and(|v| v["product"] == "filetwin" && v["artifact_kind"] == "report")
-}
-
-/// Atomically publish a report without replacing an existing destination,
-/// including one created after the initial destination check.
-pub(crate) fn rename_new(from: &Path, to: &Path) -> Result<()> {
-    let from = CString::new(path_bytes(from)).map_err(|_| Error::invalid("NUL in export path"))?;
-    let to = CString::new(path_bytes(to)).map_err(|_| Error::invalid("NUL in export path"))?;
-    #[cfg(target_os = "macos")]
-    // SAFETY: both paths are valid NUL-terminated strings; RENAME_EXCL forbids replacement.
-    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
-    #[cfg(target_os = "linux")]
-    // SAFETY: both paths are absolute, valid C strings; RENAME_NOREPLACE forbids replacement.
-    let rc = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
+pub(crate) fn still_current(file: &File, path: &Path, before: &Revision) -> bool {
+    file.metadata()
+        .ok()
+        .filter(|m| m.is_file())
+        .is_some_and(|m| Revision::of(&m).key() == before.key())
+        && open_secure(path)
+            .and_then(|f| Ok(f.metadata()?))
+            .ok()
+            .is_some_and(|m| m.is_file() && Revision::of(&m).key() == before.key())
 }

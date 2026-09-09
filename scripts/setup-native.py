@@ -135,7 +135,8 @@ def main():
     atomic_copy(ROOT / "THIRD_PARTY_NOTICES.md", model_dir / "notices/THIRD_PARTY_NOTICES.md")
     (model_dir / "installed-artifacts.json").write_text(json.dumps(installed, indent=2) + "\n")
     print(f"Verified native assets installed at {model_dir}")
-    print("FFmpeg 9 and ffprobe 9 must be installed separately; run filetwin doctor to inspect paths.")
+    print("Install FFmpeg 9 and ffprobe 9 separately and put them on PATH.")
+    print("Usage: filetwin DIRECTORY --model-dir MODEL_DIR --output vectors.json")
     if args.onnxruntime_variant == "cuda12":
         print("CUDA backend also requires a compatible NVIDIA driver, CUDA 12 runtime and cuDNN 9; these are not downloaded by this script.")
 

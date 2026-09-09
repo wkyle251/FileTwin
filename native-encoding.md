@@ -2,23 +2,24 @@
 
 The current implementation supplies encoders for all four content families in
 the design. Each file has one normalized float32 vector under one immutable
-profile. Comparisons and groups require equal family **and** profile ID. A
+profile. Caller comparisons require equal family **and** profile ID. A
 95% display cutoff means cosine >= 0.95; it is not a confidence estimate.
 
 ## Representations and coverage
 
 | Profile name | Representation | Coverage and limitations |
 | --- | --- | --- |
-| `experimental-text-v1` | 4,096-dimensional signed character n-grams | Original strict UTF-8 reader, retained unchanged for old snapshots |
+| `experimental-text-v1` | 4,096-dimensional signed character n-grams | Original strict UTF-8 reader, retained as an immutable profile definition |
 | `experimental-documents-v1` | Same text features, with a new reader-policy manifest | UTF-8; DOCX main body; PDFium page text. These inputs can match each other. DOCX auxiliary parts, layout and OCR are excluded. Empty/scanned PDF pages prevent a complete text vector. |
-| `experimental-image-sscd-v1` | SSCD `sscd_disc_mixup`, ResNet50, 512 dimensions | Original raster-only profile retained unchanged for existing snapshots |
+| `experimental-image-sscd-v1` | SSCD `sscd_disc_mixup`, ResNet50, 512 dimensions | Original raster-only profile retained unchanged for compatibility |
 | `experimental-image-sscd-v2` | Same SSCD representation; expanded reader policy | First raster image/frame with EXIF orientation, or FFmpeg 9 primary SDR HEIF/AVIF image including tile-grid reconstruction and crop/rotation. RGB8, alpha on black, triangle resize directly to 320×320, official ImageNet channel normalization |
 | `experimental-audio-landmarks-v1` | 4,096-dimensional signed spectral-peak-triplet sketch | First audio stream, mono 16 kHz; up to 32 disjoint eight-second windows centered across the timeline. Files up to 256 seconds cover the complete timeline. FFT 1024/hop 256, periodic Hann; peak triples at offsets (7,3,0), (15,7,0), (31,15,0), (63,31,0); signed square-root counts and L2 normalization. |
 | `experimental-video-sscd-v1` | Mean of normalized SSCD frame descriptors, then L2 normalization | 32 midpoint targets across the entire timeline, deduplicated by decoded PTS. The first frame is a fallback if no midpoint yields a frame. Actual integer PTS, time base, seconds and missing targets are retained. Audio and temporal order are excluded. |
 | `experimental-image-sscd-{cpu,coreml,cuda}-v1` | Same model and image preprocessing, optimized execution | Separate backend-specific IDs; optimized CPU is the new default. CoreML and CUDA are explicit choices. |
 | `experimental-video-sscd-{cpu,coreml,cuda}-v1` | Same model and 32 midpoint targets, optimized execution | Clips up to 60 seconds use one continuous decode with targets rounded to the stream time base; longer clips retain sparse seeks. Backend and decoder policy are included in the profile ID. |
 
-`profiles list` is the authoritative source for profile IDs and full manifests.
+`filetwin_core::profile::profiles()` returns profile IDs and full manifests. The
+`experimental-*` names are immutable algorithm labels, not CLI opt-in flags.
 Both audio pooling and video averaging lose some temporal information. Short
 insertions can shift samples, and short overlaps can be missed. Synthetic smoke
 tests establish implementation behavior; they do not establish real-collection
@@ -47,36 +48,39 @@ canvas and selected-item pixels, multiplied by 32 bytes, must fit half the worke
 memory allowance. PNG transfer and decode buffers are capped independently.
 FFmpeg/ffprobe are required for this path, while other image formats continue
 to use the Rust raster decoder. The original v1 image ID remains registered;
-v2 selection recomputes image vectors under its new cache binding.
+the current CPU/CoreML/CUDA image profiles include the expanded reader policy.
 
 Media signatures and extension hints route recognized containers to ffprobe.
 The detected streams decide audio versus video, ignoring attached cover art;
-an audio-only MP4 is audio even when its extension is `.mp4`. Unselected families
-are excluded. Unsupported codecs, malformed media and unknown durations return
+an audio-only MP4 is audio even when its extension is `.mp4`. All families are
+attempted automatically. Unsupported codecs, malformed media and unknown durations return
 explicit failures. Video uses FFmpeg's SDR RGB conversion and autorotation;
 PQ/HLG HDR video is rejected until a tone-mapping profile is qualified.
 
 ## Native boundary and limits
 
-`filetwin-core` opens original files without following symlinks and copies a
-cache miss into a private temporary directory. It counts source bytes read and
-optionally hashes original bytes during the copy. Native reads of that private
+`filetwin-core` opens original files without following symlinks and hashes all
+original bytes, including on cache hits. Native candidates are copied to private
+staging during hashing when the source fits admission; copies are discarded on
+cache hits. Native reads of that private
 copy and model/runtime reads are not counted again as source I/O. Before saving
 a result, the coordinator verifies the source's descriptor and pathname still
-refer to the observed revision. Fast freshness remains heuristic.
+refer to the observed revision. Reuse uses the verified content ID and profile,
+never only mtime, inode or pathname. File IDs are SHA-256 of complete originals.
 
-The companion receives internal protocol-v2 JSON lines through nonblocking pipes
+The companion receives internal protocol-v3 JSON lines through nonblocking pipes
 (64 KiB requests and 1 MiB responses/diagnostics). Both executables must be rebuilt
-together. The public CLI protocol remains v1. The coordinator drains stdout and
-stderr while checking cancellation and job time; a full pipe cannot block it.
-Native processes handle one request at a time and are reused within one job,
+together. Public output uses vector-file schema version 1. The coordinator drains stdout and
+stderr while checking cancellation and per-file deadlines; a full pipe cannot block it.
+Native processes handle one request at a time and are reused within one invocation,
 including a verified model session shared by images and video frames. A failed or
 malformed worker is discarded and replaced for subsequent files. A private
 process group contains each worker and its FFmpeg descendants. Cancellation,
-timeouts and job termination kill all groups and remove staging; a worker also
+timeouts and invocation termination kill all groups and remove staging; a worker also
 terminates its group if its host disappears. Per-file source revision validation
-and all database writes remain on the coordinator. Crash-staging garbage
-collection and reuse across jobs remain later work.
+and result assembly remain on the coordinator. There is no database. SIGKILL or
+power loss may leave temporary directories; crash-staging garbage collection and
+process reuse across invocations are not implemented.
 
 The sum of active native staging must fit `staging_bytes`, reserving an additional
 2 MiB for each pending file. File growth is checked against the remaining allowance.
@@ -84,7 +88,7 @@ The default is 10 GiB and can be raised for larger files. Buffers and image
 dimensions are capped. Native document/audio admission requires 128 MiB;
 image/video requires 512 MiB. Larger frames can require a higher allowance.
 The native worker count defaults to two and is capped at 64 and one per 512 MiB
-of the job memory allowance (at least one). Each worker receives an equal share
+of the invocation memory allowance (at least one). Each worker receives an equal share
 of that allowance. Lower the count for unusually large decoded inputs. Linux
 CPU workers have an address-space limit; CUDA workers omit it because GPU drivers
 reserve large virtual ranges, and configure the CUDA arena allowance instead.
@@ -129,10 +133,10 @@ initialize fails explicitly, while successfully initialized providers can execut
 unsupported graph nodes on CPU. Per-file extraction records include backend,
 thread count, model reuse and loading/inference/worker timings.
 
-CoreML compilation is serialized across workers and cached under the data
-directory, keyed by runtime version and model SHA-256. This generated cache is
-outside staging/result allowances and can be removed while no job is running to
-force recompilation. CUDA library search directories are explicit host settings;
+CoreML compilation is serialized across workers and cached in the invocation's
+private temporary directory, keyed by runtime version and model SHA-256. It is
+removed on normal return, error or cancellation; its size is outside source-copy
+staging allowances. CUDA library search directories are explicit host settings;
 worker environments do not inherit `LD_LIBRARY_PATH`. FFmpeg and ffprobe remain
 version 9 and their full version strings are recorded in file provenance.
 
@@ -145,10 +149,12 @@ deployed binaries with provisioned assets requires no Python installation.
 The source setup never substitutes an artifact if a checksum differs. Signed
 bundles and Ubuntu/minimum-macOS runtime qualification remain release work.
 
-Rust hosts set absolute paths in `EngineConfig.runtime`. CLI users can use
-[native-config.toml](examples/native-config.toml) or global path flags. Read-only
-queries, cached comparison and plain UTF-8 encoding work without native assets.
-Source file metadata is never modified; vectors remain in the SQLite index.
+Rust hosts set absolute paths in `EncoderConfig.runtime`. CLI users provision
+`--model-dir` and may override companion/FFmpeg paths with the environment
+variables documented in the README. Plain UTF-8 encoding and reuse of already
+verified compatible vectors work without native assets. Source metadata is never
+modified; vectors are returned directly and optionally saved to one JSON file.
+On reused records, extraction provenance describes the original encoding.
 
 ## Validation commands
 
@@ -171,18 +177,18 @@ target/model-tools/bin/python scripts/verify-sscd.py FIRST.png SECOND.png \
 
 The smoke test generates its own fixtures. It checks document equivalence,
 image formats/orientation, audio re-encoding/appended silence/hard negatives,
-video transcode/timestamps/short clips, unrelated noise recordings, family partitioning, cache reuse,
-comparison without originals, malformed/blank inputs, staging limits and native
+video transcode/timestamps/short clips, unrelated noise recordings, compatible profiles, cache reuse,
+rename reuse, unchanged originals, malformed/blank inputs and native
 orphan cleanup. The parity harness sends the exact Rust-preprocessed tensor to
 the official TorchScript model and compares the returned components.
 
-## Optimization validation
+## Historical optimization evidence
 
 Measured locally on 2026-09-09, Apple M5 Pro (18 CPU cores, 64 GiB RAM), macOS
 ARM64, release build, pinned SSCD/ONNX Runtime 1.28.2 and FFmpeg 9.0.1.
-The same 24-file sample contained 12 images and 12 videos. Each run used a
-separate index, `--cache-mode refresh` and `--exact-duplicates compute`, with
-no cached vectors. Filesystem and operating-system model caches were not cleared;
+These measurements preceded the 0.2 interface rewrite. The same 24-file sample
+contained 12 images and 12 videos. Each run forced fresh encoding and hashing,
+with no cached vectors. Filesystem and operating-system model caches were not cleared;
 these single runs describe this sample, not a general hardware guarantee.
 
 | Encoding path | Wall time, including staging and hashing | Speedup over old executable |
@@ -205,21 +211,16 @@ whole-file hashing took **79.855 s**, compared with **988.762 s** in the previou
 run, a 12.4× improvement. All 354 media files remained ready; their original
 contents, modification times and recorded hashes were unchanged. Every video's
 decoded timestamps matched the old run. The largest absolute change among all
-31,168 compatible pair scores was 9.02e-7. After caching immutable profile
-definitions, a full saved-vector comparison took **1.800 s** versus the previous
-2.426 s. Comparison continues to use the same CPU cosine calculation.
+31,168 compatible pair scores was 9.02e-7. Version 0.2 preserves these encoding
+profiles and leaves pairwise comparison to callers of the returned vectors.
 
-Local checks passed: 55 workspace tests; formatting and Clippy with warnings
-denied; release binaries/examples; all 11 generated schemas; native integration
-checks on CPU and CoreML; and 72 format fixtures on optimized CPU, including
-HEIC primary/grid/transformed images and AVIF. Regression tests cover real
+The 0.2 checks cover portable cache validation and source hashing alongside real
 concurrent worker admission, process reuse/replacement, cancellation and decoder
-cleanup, source changes during encoding, staging limits, zero-read caches,
-legacy profile identities, and explicit backend selection.
-The original reference path also passed TorchScript tensor/inference parity;
-explicit CUDA selection on macOS produced `runtime_unavailable` and no vector.
-Actual optimized-run envelopes, accepted requests and summaries validated
-against the public schemas.
+cleanup, source changes, staging limits, preserved profile identities and explicit
+backend selection. See [implementation-plan.md](implementation-plan.md) for current
+validation status. The original reference path also has a TorchScript
+tensor/inference parity harness. The generated schema set now consists of vector
+files, progress, errors and profiles.
 
 The Linux x86-64 CUDA 12 bundle was provisioned from Microsoft's official
 archive. Its archive, core runtime, CUDA provider and shared-provider checksums

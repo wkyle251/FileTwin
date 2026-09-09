@@ -5,12 +5,13 @@ Fixtures are generated locally; native runtime assets and FFmpeg 9 are required.
 This is a format/contract check, not an accuracy calibration corpus.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import shutil
-import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -27,6 +28,8 @@ def main():
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     binary, models = args.binary.resolve(), args.model_dir.resolve()
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("FILETWIN_")}
+    environment["FILETWIN_FFMPEG"] = str(Path(args.ffmpeg).resolve())
     spec = importlib.util.spec_from_file_location("native_smoke", Path(__file__).with_name("native-smoke.py"))
     fixtures = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixtures)
@@ -47,12 +50,11 @@ def main():
             assert result.returncode == 0, (command, result.stderr)
 
         def cli(*arguments, expected_exit=0):
-            command = [str(binary), "--data-dir", str(base / "index"), "--model-dir", str(models),
-                       "--ffmpeg-path", args.ffmpeg, "--format", "json", *map(str, arguments)]
-            result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+            command = [str(binary), *map(str, arguments), "--model-dir", str(models)]
+            result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=300)
             response = json.loads(result.stdout)
             assert result.returncode == expected_exit, (command, result.returncode, response, result.stderr)
-            return response["data"]
+            return response
 
         body = "FileTwin compares the complete document body across supported formats."
         for suffix in ["txt", "md", "csv", "json", "xml", "html", "rs", "py", "ts"]:
@@ -131,41 +133,46 @@ def main():
         shutil.copyfile(movie, case("renamed-video.bin", "video", "MP4 content with unrelated extension"))
 
         start = time.monotonic()
-        indexed = cli("index", source, "--experimental", "--exact-duplicates", "compute", expected_exit=0)
-        files = cli("results", "--snapshot", indexed["snapshot_id"], "--kind", "files", "--page-size", "1000")["items"]
+        original_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()}
+        saved = base / "vectors.json"
+        encoded = cli(source, "--output", saved)
+        files = encoded["files"]
         assert len(files) == len(expected), (len(files), len(expected))
-        db = sqlite3.connect(base / "index" / "index.sqlite3")
         coverage = []
         for file in files:
-            name = Path(file["locator"]["root"]).name
+            name = file["path"]
             wanted = expected[name]
             assert file["state"] == "ready" and file["family"] == wanted["family"], (name, file)
+            assert file["file_id"] == "sha256:" + original_hashes[name]
             if name == "grid.heic":
                 assert file["extraction"]["tile_grid"] and (file["extraction"]["decoded_width"], file["extraction"]["decoded_height"]) == (2560, 1440), file
             if name == "transformed.heic":
                 assert (file["extraction"]["decoded_width"], file["extraction"]["decoded_height"]) == (360, 640), file
             if name == "primary.heic":
                 assert (file["extraction"]["decoded_width"], file["extraction"]["decoded_height"]) == (1280, 854), file
-            raw = db.execute("SELECT payload FROM vectors WHERE id=?", (file["vector_id"],)).fetchone()[0]
             dimensions = 512 if wanted["family"] in ["image", "video"] else 4096
-            assert len(raw) == dimensions * 4, name
-            vector = struct.unpack("<" + "f" * dimensions, raw)
+            vector = file["vector"]
+            assert len(vector) == dimensions, name
+            raw = struct.pack("<" + "f" * dimensions, *vector)
+            assert file["vector_sha256"] == hashlib.sha256(raw).hexdigest(), name
             assert all(math.isfinite(value) for value in vector) and abs(sum(value * value for value in vector) - 1) < 1e-5, name
-            coverage.append({"file": name, **wanted, "detected_format": file["format"], "dimensions": dimensions, "state": file["state"]})
-        cached = cli("index", source, "--experimental")
-        assert cached["counts"]["cache_hits"] == len(expected) and cached["counts"]["bytes_read"] == 0, cached
-        source.rename(base / "removed-originals")
-        compared = cli("compare", "--snapshot", indexed["snapshot_id"], "--threshold", "0.95")
+            coverage.append({"file": name, **wanted, "dimensions": dimensions, "state": file["state"]})
+        cached = cli(source, saved)["summary"]
+        assert cached["counts"]["cache_hits"] == len(expected) and cached["counts"]["vectors_encoded"] == 0, cached
+        assert cached["counts"]["bytes_hashed"] == sum(f["bytes"] for f in files)
+        assert {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()} == original_hashes
+        renamed = base / "renamed-originals"; source.rename(renamed)
+        assert cli(renamed, saved)["summary"]["counts"]["cache_hits"] == len(files)
         family_counts = {family: sum(value["family"] == family for value in expected.values()) for family in ["text", "image", "audio", "video"]}
-        expected_pairs = sum(count * (count - 1) // 2 for count in family_counts.values())
-        assert compared["counts"]["pairs_compared"] == expected_pairs and compared["counts"]["bytes_read"] == 0, compared
-        assert compared["counts"]["groups"] >= 4, compared
-        pairs = cli("results", "--run", compared["run_id"], "--kind", "pairs", "--page-size", "1000")["items"]
-        names = {file["file_id"]: Path(file["locator"]["root"]).name for file in files}
-        scores = {frozenset([names[pair["file_a"]], names[pair["file_b"]]]): pair["score"]
-                  for pair in pairs if pair["match_kind"] == "similar_content"}
+        by_name = {f["path"]: f for f in files}
+        scores = {}
         for pair in image_equivalents:
-            assert scores.get(frozenset(pair), 0) > 0.999999, (pair, scores.get(frozenset(pair)))
+            a, b = [by_name[n] for n in pair]
+            assert a["profile_id"] == b["profile_id"]
+            av, bv = a["vector"], b["vector"]
+            score = sum(x*y for x,y in zip(av,bv)) / math.sqrt(sum(x*x for x in av)*sum(y*y for y in bv))
+            scores[frozenset(pair)] = score
+            assert score > 0.999999, (pair, score)
         # Supported families must retain honest outcomes for unreadable or
         # unsupported content, including exact-byte matches across such files.
         bad = base / "unsupported"
@@ -178,16 +185,19 @@ def main():
         fixtures.pdf(bad / "scanned-or-blank.pdf", "")
         if args.heif_fixtures:
             shutil.copyfile(args.heif_fixtures / "hdr.hif", bad / "hdr.hif")
-        unsupported = cli("scan", bad, "--experimental", "--threshold", "0.95", "--exact-duplicates", "compute", expected_exit=3)
-        assert unsupported["counts"]["files_ready"] == 0 and unsupported["counts"]["files_failed"] == len(list(bad.iterdir())), unsupported
-        assert unsupported["counts"]["exact_pairs"] == 1, unsupported
+        unsupported = cli(bad, expected_exit=3)
+        counts = unsupported["summary"]["counts"]
+        assert counts["files_ready"] == 0 and counts["files_failed"] == len(list(bad.iterdir())), counts
+        failed = {f["path"]: f for f in unsupported["files"]}
+        assert all(f["file_id"] is not None and f["vector"] is None and f.get("error") for f in failed.values())
+        assert failed["opaque-a.bin"]["file_id"] == failed["opaque-b.bin"]["file_id"]
         report = {"cases": sorted(coverage, key=lambda value: (value["family"], value["file"])),
                   "family_counts": family_counts, "files_ready": len(expected),
-                  "pairs_compared": expected_pairs, "cache_hits": cached["counts"]["cache_hits"],
+                  "cache_hits": cached["counts"]["cache_hits"],
                   "heif_conformance": "passed" if args.heif_fixtures else "not_run",
                   "image_equivalent_scores": [{"a":a,"b":b,"score":scores[frozenset([a,b])]} for a,b in image_equivalents],
-                  "explicit_unsupported_files": unsupported["counts"]["files_failed"],
-                  "checks": ["all advertised raster codecs", "AVIF still images", "UTF-8 and documents", "audio containers/codecs", "video containers/codecs", "content detection despite renamed extensions", "finite normalized persisted vectors", "zero-read cache", "comparison without originals", "explicit unsupported outcomes and exact matches for arbitrary readable bytes"],
+                  "explicit_unsupported_files": counts["files_failed"],
+                  "checks": ["all advertised raster codecs", "AVIF still images", "UTF-8 and documents", "audio containers/codecs", "video containers/codecs", "content detection despite renamed extensions", "finite normalized portable vectors", "verified cache", "rename reuse", "unchanged source bytes", "explicit unsupported outcomes and content IDs for arbitrary readable bytes"],
                   "elapsed_seconds": time.monotonic() - start}
         if args.report:
             args.report.write_text(json.dumps(report, indent=2) + "\n")

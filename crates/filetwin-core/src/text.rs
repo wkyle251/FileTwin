@@ -8,7 +8,6 @@ use unicode_normalization::{UnicodeNormalization, char::canonical_combining_clas
 
 pub(crate) struct EncodedText {
     pub vector: Vec<f32>,
-    pub digest: Option<String>,
     pub bytes_read: u64,
     pub characters: u64,
 }
@@ -24,7 +23,7 @@ struct Scalars<'a, R> {
     bytes_read: u64,
     hash: Option<Sha256>,
     error: Option<Error>,
-    check: &'a dyn Fn() -> Result<()>,
+    check: &'a mut dyn FnMut() -> Result<()>,
 }
 
 impl<R: Read> Scalars<'_, R> {
@@ -149,7 +148,7 @@ impl<R: Read> Iterator for Scalars<'_, R> {
 pub(crate) fn encode<R: Read>(
     reader: R,
     compute_digest: bool,
-    check: &dyn Fn() -> Result<()>,
+    check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<EncodedText> {
     let mut scalars = Scalars {
         reader,
@@ -216,7 +215,6 @@ pub(crate) fn encode<R: Read>(
     }
     Ok(EncodedText {
         vector: counts.into_iter().map(|v| (v / norm) as f32).collect(),
-        digest: scalars.hash.map(|h| format!("{:x}", h.finalize())),
         bytes_read: scalars.bytes_read,
         characters,
     })
@@ -226,7 +224,7 @@ pub(crate) fn encode<R: Read>(
 mod tests {
     use super::*;
     fn vector(s: &str) -> Vec<f32> {
-        encode(s.as_bytes(), false, &|| Ok(())).unwrap().vector
+        encode(s.as_bytes(), false, &mut || Ok(())).unwrap().vector
     }
     #[test]
     fn normalization_survives_boundaries() {
@@ -237,16 +235,22 @@ mod tests {
     #[test]
     fn malformed_empty_and_excessive_combining_marks_fail() {
         assert_eq!(
-            encode(&b"a\xff"[..], false, &|| Ok(())).err().unwrap().code,
+            encode(&b"a\xff"[..], false, &mut || Ok(()))
+                .err()
+                .unwrap()
+                .code,
             ErrorCode::InvalidText
         );
         assert_eq!(
-            encode(&b" \n"[..], false, &|| Ok(())).err().unwrap().code,
+            encode(&b" \n"[..], false, &mut || Ok(()))
+                .err()
+                .unwrap()
+                .code,
             ErrorCode::InsufficientContent
         );
         let marks = "a".to_owned() + &"\u{301}".repeat(1025);
         assert_eq!(
-            encode(marks.as_bytes(), false, &|| Ok(()))
+            encode(marks.as_bytes(), false, &mut || Ok(()))
                 .err()
                 .unwrap()
                 .code,

@@ -4,12 +4,13 @@ FileTwin supports the design's four content families. A supported family is not
 a promise to decode every format or every variant ever created. Every discovered
 regular file receives an explicit outcome under the selected profiles and limits.
 
-For arbitrary readable regular files, `--exact-duplicates compute` records SHA-256
-evidence and can group byte-identical files regardless of their format. Content
+For arbitrary fully readable unchanged regular files, FileTwin returns a SHA-256
+`file_id` automatically. Callers can recognize byte-identical files regardless of their format. Content
 similarity additionally requires successful decoding into one of these profiles.
 An unsupported, corrupt, encrypted, empty or insufficient input never receives
-a placeholder vector. Unsupported/failed content makes coverage partial and the
-CLI exits with code 3 while still publishing the usable results.
+a placeholder vector. Unsupported/failed content receives an error and null
+vector; the CLI exits with code 3 while still returning usable results.
+`complete` describes directory traversal, not universal decoder success.
 
 ## Exercised inputs
 
@@ -32,9 +33,9 @@ HEIF uses the primary image or assembled grid, not a thumbnail or one tile.
 Audio and video use their documented bounded timeline sampling policies.
 
 The suite also checks content detection after changing file extensions, finite
-unit-length stored vectors of the correct dimension, cache reuse without source
-reads, persisted comparison after moving originals, and explicit failure outcomes.
-It confirms that unsupported binary files can still form an exact-copy group.
+unit-length returned vectors of the correct dimension, portable cache reuse after
+rehashing sources, reuse after moving originals, and explicit failure outcomes.
+It confirms that unsupported byte-identical files retain the same content ID.
 
 ## Remaining exclusions
 
@@ -47,16 +48,20 @@ It confirms that unsupported binary files can still form an exact-copy group.
   unknown media duration, and inputs exceeding the configured resource limits.
 
 These exclusions concern content similarity; readable original bytes can still
-supply exact-copy evidence. Selecting fewer families records other recognized
-families as excluded. Missing native dependencies remain explicit failures.
+supply exact-copy evidence. All four families are attempted automatically.
+Missing native dependencies remain explicit failures.
 
 ## Reproduce
 
-Local verification on 2026-09-09 passed with **72 ready files** (12 text/document,
-26 image, 20 audio and 14 video), **672 comparisons**, and **72 zero-read cache
-hits**. Four HEIC/AVIF-to-PNG checks scored exactly 1.0. Six unsupported or invalid
-inputs produced explicit outcomes, with byte-identical binary inputs still
-forming an exact-copy pair. All 40 workspace tests also passed on this Mac.
+The full suite contains **72 supported fixtures** (12 text/document, 26 image,
+20 audio and 14 video), including four HEIC/AVIF-to-PNG equivalence checks. Six
+unsupported/invalid fixtures check explicit null vectors and retained content
+IDs. The portable cache check rehashes all current sources and expects no new
+encoding. See [implementation-plan.md](implementation-plan.md) for validation status.
+
+On 2026-09-09 the 0.2 CLI passed all 72 ready/reuse cases and all six explicit
+failure cases locally on macOS ARM64. All four HEIC/AVIF-to-PNG scores were 1.0;
+source hashes remained unchanged.
 
 Build and provision the native assets as described in [README.md](README.md).
 The full fixture generator requires FFmpeg 9 with libsvtav1, libvpx-vp9,

@@ -1,115 +1,16 @@
-use crate::{
-    Error, ErrorCode, Result, api::EngineConfig, engine::Work, profile, worker_protocol as protocol,
-};
+use crate::{Error, ErrorCode, Result, api::EncoderConfig, profile, worker_protocol as protocol};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
     io::{Read, Write},
     os::unix::{io::AsRawFd, process::CommandExt},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
-/// Input is copied from the already opened source into private bounded staging.
-/// Native code never reopens the user's pathname. Each worker and its decoder
-/// descendants share a private process group, terminated on every exit path.
-pub(crate) fn prepare(
-    work: &mut Work<'_>,
-    file: &mut File,
-    format: &str,
-    profile_id: &str,
-    compute: bool,
-    reserved_staging: u64,
-) -> Result<Prepared> {
-    let allowance = work.job.request.limits.as_ref().expect("Limits");
-    let staging_bytes = allowance.staging_bytes.expect("Staging limit");
-    let memory_bytes = allowance.memory_bytes.expect("Memory limit");
-    let family = profile::find(profile_id)?.family;
-    validate_runtime(&work.config, &family, format)?;
-    let required_memory = if format != "media" && (family == "image" || family == "video") {
-        512 * 1024 * 1024
-    } else {
-        128 * 1024 * 1024
-    };
-    if memory_bytes < required_memory {
-        return Err(Error::new(
-            ErrorCode::ResourceBudgetTooSmall,
-            "encoding",
-            format!(
-                "{family} encoding requires at least {} MiB",
-                required_memory / 1024 / 1024
-            ),
-        ));
-    }
-    // Reserve bounded worker protocol buffers in addition to the input copy.
-    let source_limit = staging_bytes
-        .saturating_sub(reserved_staging.saturating_add(2 * protocol::MAX_RESPONSE as u64));
-    if file.metadata()?.len() > source_limit {
-        return Err(Error::new(
-            ErrorCode::ResourceBudgetTooSmall,
-            "staging",
-            "File exceeds staging allowance (includes a 2 MiB protocol reserve)",
-        ));
-    }
-    std::fs::create_dir_all(&work.config.temp_dir)?;
-    let private = tempfile::Builder::new()
-        .prefix("filetwin-worker-")
-        .tempdir_in(&work.config.temp_dir)?;
-    let mut staged = tempfile::NamedTempFile::new_in(private.path())?;
-    let mut hash = compute.then(Sha256::new);
-    let mut bytes = 0u64;
-    let mut buffer = [0u8; 65536];
-    loop {
-        work.check()?;
-        let n = file.read(&mut buffer)?;
-        work.job.counts.bytes_read += n as u64;
-        bytes += n as u64;
-        if bytes > source_limit {
-            return Err(Error::new(
-                ErrorCode::ResourceBudgetTooSmall,
-                "staging",
-                "Source grew beyond staging allowance",
-            ));
-        }
-        if n == 0 {
-            break;
-        }
-        staged.write_all(&buffer[..n])?;
-        if let Some(h) = &mut hash {
-            h.update(&buffer[..n]);
-            work.job.counts.bytes_hashed += n as u64;
-        }
-    }
-    staged.flush()?;
-    let digest = hash.map(|h| format!("{:x}", h.finalize()));
-    let request = protocol::Request {
-        version: protocol::VERSION,
-        path: staged.path().to_owned(),
-        format: format.into(),
-        profile_id: profile_id.into(),
-        model_dir: work.config.model_dir.clone(),
-        profiles: work.job.request.profiles.clone().expect("Profiles"),
-        runtime: work.config.runtime.clone(),
-        memory_bytes,
-        parent_pid: std::process::id(),
-        inference_cache_dir: Some(work.config.data_dir.join("inference-cache")),
-    };
-    Ok(Prepared {
-        request,
-        digest,
-        bytes,
-        _staged: staged,
-        _directory: private,
-    })
-}
-
 pub(crate) struct Prepared {
-    request: protocol::Request,
-    digest: Option<String>,
-    bytes: u64,
-    _staged: tempfile::NamedTempFile,
-    _directory: tempfile::TempDir,
+    pub request: protocol::Request,
+    pub bytes: u64,
+    pub _staged: tempfile::NamedTempFile,
 }
 
 fn validate_encoded(
@@ -117,6 +18,13 @@ fn validate_encoded(
     encoded: protocol::Encoded,
 ) -> Result<protocol::Encoded> {
     let id = if request.format == "media" {
+        if !matches!(encoded.family.as_str(), "audio" | "video") {
+            return Err(Error::new(
+                ErrorCode::WorkerFailed,
+                "worker",
+                "Unexpected media family",
+            ));
+        }
         request.profiles.get(&encoded.family).ok_or_else(|| {
             Error::new(
                 ErrorCode::WorkerFailed,
@@ -147,7 +55,19 @@ fn validate_encoded(
     Ok(encoded)
 }
 
-pub(crate) fn validate_runtime(config: &EngineConfig, family: &str, format: &str) -> Result<()> {
+pub(crate) fn validate_runtime(config: &EncoderConfig, family: &str, format: &str) -> Result<()> {
+    let minimum = if matches!(family, "image" | "video") {
+        512 << 20
+    } else {
+        128 << 20
+    };
+    if config.memory_bytes / (worker_count(config) as u64) < minimum {
+        return Err(Error::new(
+            ErrorCode::ResourceBudgetTooSmall,
+            "runtime",
+            "Native memory allowance is too small for this reader",
+        ));
+    }
     let mut paths = vec![("filetwin-worker", &config.runtime.worker_path)];
     if format != "media" && (family == "image" || family == "video") {
         paths.push(("ONNX Runtime", &config.runtime.onnxruntime_path));
@@ -168,7 +88,7 @@ pub(crate) fn validate_runtime(config: &EngineConfig, family: &str, format: &str
                 ErrorCode::RuntimeUnavailable,
                 "runtime",
                 format!(
-                    "Configure an absolute existing {name} path in EngineConfig.runtime or [engine.runtime]"
+                    "Configure an absolute existing {name} path in EncoderConfig.runtime; see README runtime setup"
                 ),
             ));
         }
@@ -198,16 +118,16 @@ impl Drop for ProcessGroup {
     }
 }
 
-/// Shared admission count for the accepted event and the native coordinator.
-pub(crate) fn worker_count(request: &crate::api::JobRequest) -> usize {
-    let limits = request.limits.as_ref().expect("Resolved limits");
-    let requested = limits.inference_workers.unwrap_or(2) as usize;
-    let memory_slots = (limits.memory_bytes.unwrap_or(2 << 30) / (512 << 20)).max(1) as usize;
-    requested.min(memory_slots).clamp(1, 64)
+/// Bound concurrency by the requested count and native memory allowance.
+pub(crate) fn worker_count(config: &EncoderConfig) -> usize {
+    config
+        .workers
+        .min((config.memory_bytes / (512 << 20)).max(1) as usize)
+        .clamp(1, 64)
 }
 
 pub(crate) struct Pool {
-    config: EngineConfig,
+    config: EncoderConfig,
     slots: Vec<Slot>,
     memory_per_worker: u64,
 }
@@ -219,13 +139,13 @@ struct Slot {
     error: Option<Error>,
 }
 
-pub(crate) type Outcome = Result<(protocol::Encoded, Option<String>)>;
+pub(crate) type Outcome = Result<protocol::Encoded>;
 
 impl Pool {
-    pub fn new(work: &Work<'_>) -> Self {
-        let n = worker_count(&work.job.request);
+    pub fn new(config: &EncoderConfig) -> Self {
+        let n = worker_count(config);
         Self {
-            config: work.config.clone(),
+            config: config.clone(),
             slots: (0..n)
                 .map(|_| Slot {
                     process: None,
@@ -233,15 +153,7 @@ impl Pool {
                     error: None,
                 })
                 .collect(),
-            memory_per_worker: work
-                .job
-                .request
-                .limits
-                .as_ref()
-                .unwrap()
-                .memory_bytes
-                .unwrap()
-                / n as u64,
+            memory_per_worker: config.memory_bytes / n as u64,
         }
     }
     pub fn capacity(&self) -> usize {
@@ -291,18 +203,7 @@ impl Pool {
                 if result.is_err() {
                     slot.process = None;
                 }
-                return Some((
-                    i,
-                    match result {
-                        Ok(encoded) => Ok((encoded, prepared.digest)),
-                        Err(mut error) => {
-                            if let Some(digest) = prepared.digest {
-                                error.details["digest"] = json!(digest);
-                            }
-                            Err(error)
-                        }
-                    },
-                ));
+                return Some((i, result));
             }
         }
         None
@@ -338,7 +239,7 @@ fn nonblocking(fd: std::os::fd::RawFd) -> Result<()> {
 }
 
 impl Process {
-    fn spawn(config: &EngineConfig, request: &protocol::Request) -> Result<Self> {
+    fn spawn(config: &EncoderConfig, request: &protocol::Request) -> Result<Self> {
         let directory = tempfile::Builder::new()
             .prefix("filetwin-session-")
             .tempdir_in(&config.temp_dir)?;

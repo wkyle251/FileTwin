@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{io::Read, path::PathBuf};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_RESPONSE: usize = 1024 * 1024;
 pub const MAX_TEXT_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_FILE_SECONDS: u64 = 300;
@@ -44,6 +44,6 @@ pub struct Response {
 }
 
 pub fn encode_text(reader: impl Read) -> Result<(Vec<f32>, u64)> {
-    let e = crate::text::encode(reader, false, &|| Ok(()))?;
+    let e = crate::text::encode(reader, false, &mut || Ok(()))?;
     Ok((e.vector, e.characters))
 }

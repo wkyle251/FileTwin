@@ -1,42 +1,57 @@
-//! The embedding application supplies paths and owns presentation/lifetime.
-use filetwin_core::{Catalog, Engine, HostServices, api::*};
-use std::path::PathBuf;
+//! Run: cargo run -p filetwin-core --example host -- /absolute/directory [/absolute/vectors.json]
+use filetwin_core::{
+    Encoder,
+    api::{CancellationToken, EncodeRequest, EncoderConfig},
+    write_vectors,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
-    let data = PathBuf::from(
-        args.next()
-            .ok_or("Usage: host ABSOLUTE_DATA_DIR ABSOLUTE_SOURCE")?,
+    let directory = std::fs::canonicalize(args.next().ok_or("Supply a directory")?)?;
+    let cwd = std::env::current_dir()?;
+    let mut request = EncodeRequest::new(directory);
+    request.vectors_file = args.next().map(std::fs::canonicalize).transpose()?;
+    request.output_file = Some(cwd.join("vectors.json"));
+    let mut config = EncoderConfig::new(cwd.join(".filetwin/models"), std::env::temp_dir());
+    config.runtime.worker_path = Some(cwd.join("target/release/filetwin-worker"));
+    let suffix = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    config.runtime.onnxruntime_path = Some(
+        config
+            .model_dir
+            .join(format!("runtime/libonnxruntime.{suffix}")),
     );
-    let source = PathBuf::from(args.next().ok_or("Missing absolute source path")?);
-    let engine = Engine::open(EngineConfig::new(&data), HostServices::default())?;
-    let job = engine.submit(JobRequest::text_scan([source], 0.7))?;
-    // An event-driven host can forward these counts to its UI and call job.cancel().
-    // Keep presentation in the host: the core never writes to standard streams.
-    for event in job.events() {
-        if let JobEvent::Progress { data, .. } = event {
-            eprintln!("progress: {data}");
-        }
-    }
-    let summary = job.wait()?;
-    println!("{}", serde_json::to_string_pretty(&summary)?);
-    if let Some(run) = &summary.run_id {
-        let catalog = Catalog::open_read_only(&data)?;
-        let page = catalog.results(ResultsQuery {
-            run_id: Some(run.clone()),
-            kind: "groups".into(),
-            page_size: Some(20),
-            ..ResultsQuery::default()
-        })?;
-        println!("{}", serde_json::to_string_pretty(&page)?);
-    }
-    engine.shutdown()?;
-    if summary.exit_code() != 0 {
-        return Err(format!(
-            "Job ended with {} coverage",
-            summary.completeness.source_coverage
-        )
-        .into());
+    config.runtime.pdfium_path = Some(config.model_dir.join(format!("runtime/libpdfium.{suffix}")));
+    // The host chooses how to find native executables; the library does not
+    // inspect the environment. This example supports these explicit overrides.
+    config.runtime.ffmpeg_path = std::env::var_os("FILETWIN_FFMPEG")
+        .map(std::fs::canonicalize)
+        .transpose()?;
+    config.runtime.ffprobe_path = std::env::var_os("FILETWIN_FFPROBE")
+        .map(std::fs::canonicalize)
+        .transpose()?;
+    // Supply both for HEIC/AVIF, audio and video.
+    // Select profile::Backend::Coreml or ::Cuda explicitly for GPU inference.
+    let encoder = Encoder::new(config)?;
+    let result = encoder.encode(&request, &CancellationToken::default(), |progress| {
+        eprintln!(
+            "{} processed, {} encoded, {} reused",
+            progress.counts.files_processed,
+            progress.counts.vectors_encoded,
+            progress.counts.cache_hits
+        );
+    })?;
+    write_vectors(request.output_file.as_deref().unwrap(), &result)?;
+    for file in &result.files {
+        println!(
+            "{:?}: {:?}, {} vector components",
+            file.path,
+            file.file_id,
+            file.vector.as_ref().map_or(0, Vec::len)
+        );
     }
     Ok(())
 }

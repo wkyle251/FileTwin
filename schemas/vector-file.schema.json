@@ -1,0 +1,308 @@
+{
+  "$defs": {
+    "Backend": {
+      "description": "Execution choices have distinct profile identities; reference snapshots keep\ntheir original preprocessing and inference contract.",
+      "enum": [
+        "reference",
+        "cpu",
+        "coreml",
+        "cuda"
+      ],
+      "type": "string"
+    },
+    "Counts": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes_hashed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bytes_read": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_hits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_discovered": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_failed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_processed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_ready": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_skipped": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "vectors_encoded": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "files_discovered",
+        "files_processed",
+        "files_ready",
+        "files_failed",
+        "files_skipped",
+        "vectors_encoded",
+        "cache_hits",
+        "bytes_read",
+        "bytes_hashed"
+      ],
+      "type": "object"
+    },
+    "Error": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "details": true,
+        "message": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "stage",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "enum": [
+        "invalid_request",
+        "unsupported_schema_version",
+        "unknown_profile",
+        "invalid_vector_file",
+        "io_error",
+        "resource_budget_too_small",
+        "source_changed",
+        "unsupported_format",
+        "unselected_family",
+        "invalid_text",
+        "insufficient_content",
+        "runtime_unavailable",
+        "model_integrity",
+        "decode_failed",
+        "worker_failed",
+        "worker_timeout",
+        "output_closed",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "FilePath": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "base64": {
+              "type": "string"
+            },
+            "encoding": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "encoding",
+            "base64"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Normal paths are strings. Non-UTF-8 POSIX filenames remain lossless."
+    },
+    "FileRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Error"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "extraction": true,
+        "family": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_id": {
+          "description": "SHA-256 of complete original bytes; identical copies share this identifier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/FilePath",
+          "description": "Relative to VectorFile.directory. Paths are labels, never cache lookup keys."
+        },
+        "profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reused": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/FileState"
+        },
+        "vector": {
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "vector_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "state",
+        "reused"
+      ],
+      "type": "object"
+    },
+    "FileState": {
+      "enum": [
+        "ready",
+        "failed",
+        "unsupported",
+        "skipped"
+      ],
+      "type": "string"
+    },
+    "Summary": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/Backend"
+        },
+        "cancelled": {
+          "type": "boolean"
+        },
+        "counts": {
+          "$ref": "#/$defs/Counts"
+        },
+        "elapsed_seconds": {
+          "format": "double",
+          "type": "number"
+        },
+        "workers": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "counts",
+        "elapsed_seconds",
+        "backend",
+        "workers",
+        "cancelled"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "This is both the returned result and the optional cache input for another run.",
+  "properties": {
+    "complete": {
+      "description": "False on cancellation or an incomplete directory listing. Individual\ndecoding failures are represented in files even when traversal completes.",
+      "type": "boolean"
+    },
+    "directory": {
+      "$ref": "#/$defs/FilePath"
+    },
+    "files": {
+      "items": {
+        "$ref": "#/$defs/FileRecord"
+      },
+      "type": "array"
+    },
+    "format": {
+      "const": "filetwin-vectors",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "summary": {
+      "$ref": "#/$defs/Summary"
+    }
+  },
+  "required": [
+    "format",
+    "schema_version",
+    "directory",
+    "complete",
+    "files",
+    "summary"
+  ],
+  "title": "VectorFile",
+  "type": "object"
+}

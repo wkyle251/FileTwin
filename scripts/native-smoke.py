@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Real native encoder integration checks; requires provisioned models and FFmpeg 9."""
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
 from pathlib import Path
 import shutil
-import sqlite3
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -53,7 +54,7 @@ def main():
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--ffmpeg", default=shutil.which("ffmpeg"))
     parser.add_argument("--report", type=Path)
-    parser.add_argument("--backend", choices=["cpu", "reference", "coreml", "cuda"], default="cpu")
+    parser.add_argument("--backend", choices=["cpu", "coreml", "cuda"], default="cpu")
     args = parser.parse_args()
     binary = args.binary.resolve()
     model_dir = args.model_dir.resolve()
@@ -62,17 +63,19 @@ def main():
         tmp = Path(tmp)
         source = tmp / "input"
         source.mkdir()
-        data = tmp / "data"
+        saved = tmp / "vectors.json"
+        environment = {k: v for k, v in os.environ.items() if not k.startswith("FILETWIN_")}
+        environment["FILETWIN_FFMPEG"] = str(Path(args.ffmpeg).resolve())
         def ffmpeg(*cmd):
             subprocess.run([args.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *map(str, cmd)], check=True, timeout=60)
         def cli(*cmd, expected=0):
-            if cmd and cmd[0] in ["scan", "index"]:
-                cmd = (*cmd, "--backend", args.backend)
-            p = subprocess.run([str(binary), "--data-dir", str(data), "--model-dir", str(model_dir),
-                                "--ffmpeg-path", args.ffmpeg, "--format", "jsonl", *map(str, cmd)], capture_output=True, text=True, timeout=300)
-            events = [json.loads(line) for line in p.stdout.splitlines()]
-            assert p.returncode == expected, (p.returncode, p.stderr, [e for e in events if e["type"] in ["summary", "error"]])
-            return events[-1]["data"]
+            p = subprocess.run([str(binary), *map(str, cmd), "--model-dir", str(model_dir), "--backend", args.backend],
+                               capture_output=True, text=True, env=environment, timeout=300)
+            result = json.loads(p.stdout)
+            assert p.returncode == expected, (p.returncode, p.stderr, result["summary"], [f for f in result["files"] if f["state"] != "ready"])
+            progress = [json.loads(line) for line in p.stderr.splitlines()]
+            assert progress[-1]["data"]["counts"] == result["summary"]["counts"]
+            return result
         text = "FileTwin checks document text across formats."
         (source / "document.txt").write_text(text + "\n")
         with zipfile.ZipFile(source / "document.docx", "w", zipfile.ZIP_DEFLATED) as z:
@@ -97,19 +100,18 @@ def main():
         ffmpeg("-i", source / "recording.wav", "-af", "apad=pad_dur=1", source / "recording-appended.wav")
         ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=12:duration=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", source / "movie.mp4")
         ffmpeg("-i", source / "movie.mp4", "-vf", "scale=160:120", "-c:v", "mpeg4", "-q:v", "4", source / "movie.avi")
-        summary = cli("scan", source, "--experimental", "--threshold", "-1", "--exact-duplicates", "compute")
+        original_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()}
+        encoded = cli(source, "--output", saved)
+        summary = encoded["summary"]
         assert summary["counts"]["files_ready"] == len(list(source.iterdir())), summary
-        files = cli("results", "--run", summary["run_id"], "--kind", "files")["items"]
-        by_name = {Path(f["locator"]["root"]).name:f for f in files}
+        files = encoded["files"]
+        by_name = {f["path"]:f for f in files}
+        assert {f["path"]: f["file_id"] for f in files} == {n:"sha256:" + h for n,h in original_hashes.items()}
         assert by_name["audio-only.mp4"]["family"] == "audio"
         assert {f["family"] for f in files} == {"text", "image", "audio", "video"}
-        db = sqlite3.connect(data / "index.sqlite3")
         def score(a, b):
-            vectors = []
-            for name in [a, b]:
-                raw = db.execute("SELECT payload FROM vectors WHERE id=?", (by_name[name]["vector_id"],)).fetchone()[0]
-                vectors.append(struct.unpack("<" + "f" * (len(raw) // 4), raw))
-            a, b = vectors
+            assert by_name[a]["profile_id"] == by_name[b]["profile_id"]
+            a, b = by_name[a]["vector"], by_name[b]["vector"]
             return sum(x*y for x,y in zip(a,b)) / math.sqrt(sum(x*x for x in a)*sum(x*x for x in b))
         report["scores"] = {
             "text_docx":score("document.txt", "document.docx"), "text_pdf":score("document.txt", "document.pdf"),
@@ -133,25 +135,22 @@ def main():
             assert len({f["decoded_pts"] for f in frames}) == len(frames)
             assert max(f["relative_seconds"] for f in frames) > 0.8 * extraction["duration_seconds"]
             report[name] = {"distinct_frames":len(frames), "last_pts_seconds":max(f["relative_seconds"] for f in frames)}
-        pairs = cli("results", "--run", summary["run_id"], "--kind", "pairs")["items"]
-        ids = {f["file_id"]:f for f in files}
-        for pair in pairs:
-            if pair["match_kind"] == "similar_content":
-                assert ids[pair["file_a"]]["profile_id"] == ids[pair["file_b"]]["profile_id"] == pair["profile_id"]
+        assert len({f["profile_id"] for f in files}) == 4
         report["backend"] = args.backend
         report["counts"] = summary["counts"]
         for item in files:
             if item["family"] in ["image", "video"]:
                 assert item["extraction"]["inference"]["backend"] == args.backend
         assert any(item.get("extraction", {}).get("inference", {}).get("model_reused") for item in files)
-        cached = cli("scan", source, "--experimental", "--threshold", "-1")
-        assert cached["counts"]["cache_hits"] == len(files) and cached["counts"]["bytes_read"] == 0
-        filtered = cli("scan", source / "audio-only.mp4", "--experimental", "--families", "audio", "--threshold", "0.95")
-        assert filtered["counts"]["files_ready"] == 1
+        cached = cli(source, saved)
+        assert cached["summary"]["counts"]["cache_hits"] == len(files)
+        assert cached["summary"]["counts"]["vectors_encoded"] == 0
+        assert cached["summary"]["counts"]["bytes_hashed"] == sum(f["bytes"] for f in files)
         renamed = tmp / "originals-renamed"
         source.rename(renamed)
-        frozen = cli("compare", "--snapshot", summary["snapshot_id"], "--threshold", "0.95")
-        assert frozen["counts"]["bytes_read"] == 0
+        moved = cli(renamed, saved)
+        assert moved["summary"]["counts"]["cache_hits"] == len(files)
+        assert {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in renamed.iterdir()} == original_hashes
         # Corrupt/empty/unsupported input is explicit and must never get a vector.
         bad = tmp / "bad"; bad.mkdir()
         (bad / "broken.png").write_bytes(b"\x89PNG\r\n\x1a\ninvalid")
@@ -159,45 +158,42 @@ def main():
         pdf(bad / "blank.pdf", "")
         with zipfile.ZipFile(bad / "archive.zip", "w") as z:
             z.writestr("arbitrary.txt", "Not a DOCX document")
-        failure = cli("scan", bad, "--experimental", "--threshold", "0.95", expected=3)
+        failure = cli(bad, expected=3)["summary"]
         assert failure["counts"]["files_failed"] == 4 and failure["counts"]["files_ready"] == 0
-        limited = cli("scan", renamed / "picture.png", "--experimental", "--families", "image", "--threshold", "0.95", "--staging-bytes", "1", "--cache-mode", "refresh", expected=3)
-        assert limited["counts"]["files_ready"] == 0
         # A one-frame clip still gets one descriptor; empty midpoint targets do
         # not manufacture duplicate evidence or discard the available frame.
-        still = tmp / "still.mp4"
+        edge = tmp / "edge-cases"; edge.mkdir()
+        still = edge / "still.mp4"
         ffmpeg("-i", renamed / "picture.png", "-frames:v", "1", "-r", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", still)
-        short = cli("scan", still, "--experimental", "--families", "video", "--threshold", "0.95")
-        short_file = cli("results", "--run", short["run_id"], "--kind", "files")["items"][0]
+        short_file = cli(edge)["files"][0]
         assert short_file["extraction"]["distinct_frames"] == 1
-        delayed = tmp / "delayed.mp4"
+        delayed = edge / "delayed.mp4"
         ffmpeg("-i", renamed / "recording.wav", "-itsoffset", "1", "-i", renamed / "movie.mp4", "-map", "0:a:0", "-map", "1:v:0", "-c:a", "aac", "-c:v", "copy", delayed)
-        delayed_summary = cli("scan", delayed, "--experimental", "--families", "video", "--threshold", "0.95")
-        delayed_file = cli("results", "--run", delayed_summary["run_id"], "--kind", "files")["items"][0]
+        delayed_file = next(f for f in cli(edge)["files"] if f["path"] == "delayed.mp4")
         by_name["delayed.mp4"] = delayed_file
         assert delayed_file["extraction"]["stream_start_seconds"] >= 0.99
         assert max(f["decoded_pts_seconds"] for f in delayed_file["extraction"]["frames"]) > 3.8
         report["scores"]["video_shifted_timestamps"] = score("movie.mp4", "delayed.mp4")
         assert report["scores"]["video_shifted_timestamps"] > 0.99999
-        noise_paths = []
+        noise_dir = tmp / "noise"; noise_dir.mkdir()
         for seed in [0, 1]:
-            path = tmp / f"noise-{seed}.wav"
+            path = noise_dir / f"noise-{seed}.wav"
             rng = random.Random(seed)
             with wave.open(str(path), "wb") as wav:
                 wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
                 wav.writeframes(struct.pack("<" + "h" * 48000, *[rng.randrange(-10000, 10001) for _ in range(48000)]))
-            noise_paths.append(path)
-        noise_summary = cli("scan", *noise_paths, "--experimental", "--families", "audio", "--threshold", "-1")
-        noise_pair = cli("results", "--run", noise_summary["run_id"], "--kind", "pairs")["items"][0]
-        report["scores"]["unrelated_noise_recordings"] = noise_pair["score"]
-        assert noise_pair["score"] < 0.3
+        by_name.update({f["path"]:f for f in cli(noise_dir)["files"]})
+        report["scores"]["unrelated_noise_recordings"] = score("noise-0.wav", "noise-1.wav")
+        assert report["scores"]["unrelated_noise_recordings"] < 0.3
         # Verify cleanup by the real worker when the embedding host is killed.
         pid_file = tmp / "decoder.pid"
         fake = tmp / "blocked-ffmpeg"
-        fake.write_text(f"#!/bin/sh\nprintf '%s' \"$$\" > '{pid_file}'\nexec /bin/sleep 120\n")
+        fake.write_text(f"#!/bin/sh\nprintf '%s' \"$$\" > {shlex.quote(str(pid_file))}\nexec /bin/sleep 120\n")
         fake.chmod(0o700)
-        host = subprocess.Popen([str(binary), "--data-dir", str(tmp/"orphan-check"), "--model-dir", str(model_dir),
-                                 "--ffmpeg-path", str(fake), "scan", str(renamed/"recording.wav"), "--experimental", "--families", "audio", "--threshold", "0.95", "--format", "jsonl"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        orphan = tmp / "orphan-input"; orphan.mkdir()
+        shutil.copyfile(renamed / "recording.wav", orphan / "recording.wav")
+        host = subprocess.Popen([str(binary), str(orphan), "--model-dir", str(model_dir)],
+                                env={**environment, "FILETWIN_FFMPEG":str(fake)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             deadline = time.monotonic()+10
             while not pid_file.exists():
@@ -220,7 +216,7 @@ def main():
         finally:
             if host.poll() is None:
                 host.kill(); host.communicate(timeout=5)
-        report["checks"] = ["all families", "document extraction", "image formats and EXIF", "audio codec/rate changes and hard negatives including unrelated noise", "video transcode and timeline coverage", "mixed profile partition", "zero-read cache", "audio-only MP4 detection", "compare without originals", "corrupt and blank inputs", "staging admission", "single-frame video", "shifted video stream timestamps", "native orphan cleanup after host SIGKILL"]
+        report["checks"] = ["all families", "document extraction", "image formats and EXIF", "audio codec/rate changes and hard negatives including unrelated noise", "video transcode and timeline coverage", "profile compatibility", "verified portable cache", "audio-only MP4 detection", "rename reuse", "unchanged source bytes", "corrupt and blank inputs", "single-frame video", "shifted video stream timestamps", "native orphan cleanup after host SIGKILL"]
     print(json.dumps(report, indent=2))
     if args.report:
         args.report.write_text(json.dumps(report, indent=2) + "\n")

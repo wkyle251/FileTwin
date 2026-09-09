@@ -1,374 +1,182 @@
-mod args;
-mod config;
-mod output;
-
-use args::{Cli, Command, Format};
-use clap::{CommandFactory, Parser};
-use config::Configuration;
+use clap::Parser;
 use filetwin_core::{
-    Catalog, Engine, Error, ErrorCode, HostServices, JobHandle, Result, api::*, capabilities,
-    profile,
+    Encoder, Error, Result,
+    api::{CancellationToken, EncodeRequest, EncoderConfig},
+    profile::Backend,
+    write_vectors,
 };
-use output::{Output, Signals};
 use serde_json::json;
 use std::{
-    io::IsTerminal,
-    process::ExitCode,
-    time::{Duration, Instant},
+    io::Write,
+    path::{Component, Path, PathBuf},
 };
 
-fn main() -> ExitCode {
-    ExitCode::from(entry() as u8)
+#[derive(Parser)]
+#[command(
+    name = "filetwin",
+    version,
+    about = "Encode a directory and return file IDs with vectors",
+    after_help = "JSON vectors go to stdout; progress counters go to stderr as JSONL.\nThe optional VECTORS_FILE reuses vectors after verifying current file contents.\nNo database, thresholds or experimental flags are required."
+)]
+struct Args {
+    /// Directory to read recursively, including hidden files.
+    directory: PathBuf,
+    /// A vector JSON file from a previous run (optional).
+    vectors_file: Option<PathBuf>,
+    /// Also save the returned JSON atomically; existing FileTwin vector files may be replaced.
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
+    /// Native model/runtime assets (default: FILETWIN_MODEL_DIR or .filetwin/models).
+    #[arg(long, value_name = "DIR")]
+    model_dir: Option<PathBuf>,
+    /// Image/video inference backend; CUDA requires Linux x86-64 and NVIDIA dependencies.
+    #[arg(long, default_value = "cpu", value_parser = ["cpu", "coreml", "cuda"])]
+    backend: String,
+    /// Concurrent native files (default: 2; CUDA: 1).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=64))]
+    workers: Option<u32>,
 }
 
-fn entry() -> i32 {
-    let raw: Vec<_> = std::env::args_os().collect();
-    let parsed = Cli::try_parse_from(&raw);
-    let default_format = if std::io::stdout().is_terminal() {
-        Format::Human
+fn absolute(path: &Path, cwd: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_owned()
     } else {
-        Format::Jsonl
+        cwd.join(path)
     };
-    let format = parsed
-        .as_ref()
-        .ok()
-        .and_then(|c| c.format)
-        .unwrap_or_else(|| {
-            raw.iter()
-                .enumerate()
-                .find_map(|(i, s)| {
-                    s.to_str().and_then(|s| {
-                        if let Some(v) = s.strip_prefix("--format=") {
-                            format_name(v)
-                        } else if s == "--format" {
-                            raw.get(i + 1)
-                                .and_then(|v| v.to_str())
-                                .and_then(format_name)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or(default_format)
-        });
-    let signals = match Signals::install() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{}", e.message);
-            return 1;
-        }
-    };
-    let request_id = parsed
-        .as_ref()
-        .ok()
-        .and_then(|c| c.request_id.clone())
-        .unwrap_or_else(|| format!("request_{}", uuid::Uuid::new_v4()));
-    let mut output = match Output::new(format, request_id, signals.received.clone()) {
-        Ok(o) => o,
-        Err(_) => return 1,
-    };
-    let cli = match parsed {
-        Ok(cli) => cli,
-        Err(error) => {
-            if matches!(
-                error.kind(),
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-            ) {
-                return if output.raw(&error.to_string()).is_ok() {
-                    0
-                } else {
-                    1
-                };
+    let mut result = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => (),
+            Component::ParentDir => {
+                result.pop();
             }
-            let _ = output.emit("error", json!(Error::invalid(error.to_string())));
-            return 2;
+            value => result.push(value.as_os_str()),
         }
-    };
-    if cli.command.is_none() {
-        return if output
-            .raw(&format!("{}\n", Cli::command().render_long_help()))
-            .is_ok()
-        {
-            0
-        } else {
-            1
-        };
     }
-    match execute(&cli, &signals, &mut output) {
-        Ok(code) => code,
-        Err(error) => {
-            let code = if signals.cancelled() && error.code == ErrorCode::Cancelled {
-                signals.exit_code()
-            } else {
-                error.exit_code()
-            };
-            if error.code == ErrorCode::OutputClosed {
-                return 1;
-            }
-            if output.emit("error", json!(error)).is_err() {
+    result
+}
+fn executable(name: &str, variable: &str, cwd: &Path) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(variable) {
+        return Some(absolute(Path::new(&path), cwd));
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| absolute(&dir.join(name), cwd))
+            .find(|path| path.is_file())
+    })
+}
+fn event(value: &serde_json::Value) -> std::io::Result<()> {
+    let mut stderr = std::io::stderr().lock();
+    serde_json::to_writer(&mut stderr, value)?;
+    stderr.write_all(b"\n")
+}
+fn run(args: Args) -> Result<i32> {
+    let cwd = std::env::current_dir()?;
+    let models = args
+        .model_dir
+        .or_else(|| std::env::var_os("FILETWIN_MODEL_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(".filetwin/models"));
+    let mut config = EncoderConfig::new(absolute(&models, &cwd), std::env::temp_dir());
+    config.backend = serde_json::from_value(json!(args.backend))?;
+    config.workers =
+        args.workers
+            .map(|n| n as usize)
+            .unwrap_or(if config.backend == Backend::Cuda {
                 1
             } else {
-                code
-            }
-        }
-    }
-}
-fn format_name(value: &str) -> Option<Format> {
-    match value {
-        "human" => Some(Format::Human),
-        "json" => Some(Format::Json),
-        "jsonl" => Some(Format::Jsonl),
-        _ => None,
-    }
-}
-
-fn execute(cli: &Cli, signals: &Signals, output: &mut Output) -> Result<i32> {
-    let config = Configuration::load(cli)?;
-    let command = cli.command.as_ref().expect("Checked command");
-    let request_id = output.request_id.clone();
-    let request = match command {
-        Command::Scan(args) => Some(config.flag_request(
-            Some(&args.input),
-            Some(&args.matching),
-            None,
-            "scan",
-            None,
-            &request_id,
-        )?),
-        Command::Index(args) => {
-            Some(config.flag_request(Some(args), None, None, "index", None, &request_id)?)
-        }
-        Command::Compare(args) => Some(config.flag_request(
-            None,
-            Some(&args.matching),
-            Some(&args.limits),
-            "compare",
-            Some(&args.snapshot),
-            &request_id,
-        )?),
-        Command::Group(args) => {
-            let matching = args::MatchingArgs {
-                all_scores: false,
-                threshold: args.threshold.clone(),
-                pair_scope: None,
-                retrieval: None,
-            };
-            let mut request = config.flag_request(
-                None,
-                Some(&matching),
-                Some(&args.limits),
-                "group",
-                Some(&args.run),
-                &request_id,
-            )?;
-            request.source_revision = args.revision;
-            Some(request)
-        }
-        Command::Run { request } => {
-            if cli.request_id.is_some() {
-                return Err(Error::invalid(
-                    "run takes request_id from the JSON request; omit --request-id",
-                ));
-            }
-            Some(config.json_request(request, &request_id)?)
-        }
-        _ => None,
-    };
-    if let Some(request) = request {
-        if let Some(id) = &request.request_id {
-            output.request_id = id.clone();
-        }
-        let engine = Engine::open(config.engine, HostServices::default())?;
-        let handle = engine.submit(request)?;
-        let result = drive(&handle, cli, signals, output);
-        let shutdown = engine.shutdown();
-        return result.and_then(|code| {
-            shutdown?;
-            Ok(code)
-        });
-    }
-    match command {
-        Command::Resume { job } => {
-            let engine = Engine::open(config.engine, HostServices::default())?;
-            let handle = engine.resume(job)?;
-            let result = drive(&handle, cli, signals, output);
-            let shutdown = engine.shutdown();
-            result.and_then(|code| {
-                shutdown?;
-                Ok(code)
-            })
-        }
-        Command::Status { job } => {
-            let value = Catalog::open_read_only(config.engine.data_dir)?.status(StatusQuery {
-                schema_version: 1,
-                job_id: job.clone(),
-                request_id: Some(request_id),
-            })?;
-            output.job_id = Some(job.clone());
-            output.run_id = value["run_id"].as_str().map(str::to_owned);
-            output.emit("status", value)?;
-            Ok(0)
-        }
-        Command::Results(args) => {
-            let page = Catalog::open_read_only(config.engine.data_dir)?.results(ResultsQuery {
-                schema_version: 1,
-                request_id: Some(request_id),
-                run_id: args.target.run.clone(),
-                snapshot_id: args.target.snapshot.clone(),
-                kind: args.kind.clone(),
-                group_id: args.group.clone(),
-                file_id: args.file.clone(),
-                result_revision: args.target.revision,
-                cursor: args.cursor.clone(),
-                page_size: args.page_size,
-                min_score: args.min_score,
-            })?;
-            output.run_id = page.run_id.clone();
-            output.emit("page", json!(page))?;
-            Ok(0)
-        }
-        Command::Matrix(args) => {
-            let page = Catalog::open_read_only(config.engine.data_dir)?.matrix_with_cancel(
-                MatrixQuery {
-                    schema_version: 1,
-                    run_id: args.run.clone(),
-                    result_revision: args.revision,
-                    row_offset: args.row_offset,
-                    column_offset: args.column_offset,
-                    row_limit: args.row_limit,
-                    column_limit: args.column_limit,
-                },
-                &|| signals.cancelled(),
-            )?;
-            output.run_id = Some(page.run_id.clone());
-            output.emit("matrix", json!(page))?;
-            Ok(0)
-        }
-        Command::Export(args) => {
-            let manifest = Catalog::open_read_only(config.engine.data_dir)?.export_with_cancel(
-                ExportRequest {
-                    schema_version: 1,
-                    request_id: Some(request_id),
-                    run_id: args.target.run.clone(),
-                    snapshot_id: args.target.snapshot.clone(),
-                    result_revision: args.target.revision,
-                    format: args.report_format.clone(),
-                    directory: config::absolute(&args.report_dir, &config.cwd),
-                },
-                &|| signals.cancelled(),
-            )?;
-            output.run_id = args.target.run.clone();
-            output.emit("export", manifest)?;
-            Ok(0)
-        }
-        Command::Profiles { .. } => {
-            output.emit("profiles", json!({"profiles":profile::profiles()}))?;
-            Ok(0)
-        }
-        Command::Doctor => {
-            let mut value = capabilities();
-            value["paths"] = json!({"data_dir":config.engine.data_dir,"model_dir":config.engine.model_dir,"temp_dir":config.engine.temp_dir});
-            value["runtime"] = json!(config.engine.runtime);
-            value["runtime_files_present"] = json!({
-                "worker":config.engine.runtime.worker_path.as_ref().is_some_and(|p| p.is_file()),
-                "ffmpeg":config.engine.runtime.ffmpeg_path.as_ref().is_some_and(|p| p.is_file()),
-                "ffprobe":config.engine.runtime.ffprobe_path.as_ref().is_some_and(|p| p.is_file()),
-                "onnxruntime":config.engine.runtime.onnxruntime_path.as_ref().is_some_and(|p| p.is_file()),
-                "pdfium":config.engine.runtime.pdfium_path.as_ref().is_some_and(|p| p.is_file()),
-                "sscd_model":config.engine.model_dir.join(profile::SSCD_MODEL_FILE).is_file()
+                2
             });
-            output.emit("capabilities", value)?;
-            Ok(0)
-        }
-        _ => unreachable!("Processing commands handled above"),
-    }
-}
-
-fn drive(handle: &JobHandle, cli: &Cli, signals: &Signals, output: &mut Output) -> Result<i32> {
-    output.job_id = Some(handle.id().into());
-    let events = handle.events();
-    let interval = Duration::from_millis(cli.progress_interval_ms);
-    let mut last_progress = Instant::now();
-    let mut failure = None;
-    loop {
-        if failure.is_none() && output.closed() {
-            handle.cancel_for_output_failure();
-            failure = Some(Error::new(
-                ErrorCode::OutputClosed,
-                "output",
-                "The output pipe closed",
-            ));
-        }
-        if signals.cancelled() {
-            handle.cancel();
-        }
-        match events.recv_timeout(Duration::from_millis(50)) {
-            Ok(event) => {
-                if failure.is_none() {
-                    let result = match event {
-                        JobEvent::Accepted { run_id, data, .. } => {
-                            output.run_id = run_id;
-                            if output.format == Format::Jsonl {
-                                output.emit("accepted", data)
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        JobEvent::Progress { run_id, data, .. } => {
-                            output.run_id = run_id;
-                            if last_progress.elapsed() >= interval {
-                                last_progress = Instant::now();
-                                if output.format == Format::Jsonl {
-                                    output.emit("progress", data)
-                                } else {
-                                    if output.interactive_progress() {
-                                        output.diagnostic(&format!(
-                                            "{}: {} files ready",
-                                            data["stage"].as_str().unwrap_or("processing"),
-                                            data["counts"]["files_ready"]
-                                        ));
-                                    }
-                                    Ok(())
-                                }
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        JobEvent::Error { run_id, error, .. } => {
-                            output.run_id = run_id;
-                            if output.format == Format::Jsonl {
-                                output.emit("error", json!(error))
-                            } else {
-                                if output.format == Format::Human && cli.log_level != "error" {
-                                    output.diagnostic(&error.message);
-                                }
-                                Ok(())
-                            }
-                        }
-                        JobEvent::Summary(_) => Ok(()), // wait() is authoritative even if events coalesce.
-                    };
-                    if let Err(error) = result {
-                        handle.cancel_for_output_failure();
-                        failure = Some(error);
-                    }
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => (),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
-        if handle.is_finished() && events.is_empty() {
-            break;
-        }
-    }
-    let summary = handle.wait()?;
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    output.run_id = summary.run_id.clone();
-    output.emit("summary", serde_json::to_value(&summary)?)?;
-    if signals.cancelled() && summary.status == "cancelled" {
-        Ok(signals.exit_code())
+    config.runtime.worker_path = std::env::var_os("FILETWIN_WORKER")
+        .map(|p| absolute(Path::new(&p), &cwd))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|p| p.with_file_name("filetwin-worker"))
+        });
+    config.runtime.ffmpeg_path = executable("ffmpeg", "FILETWIN_FFMPEG", &cwd);
+    config.runtime.ffprobe_path = executable("ffprobe", "FILETWIN_FFPROBE", &cwd);
+    let suffix = if cfg!(target_os = "macos") {
+        "dylib"
     } else {
-        Ok(summary.exit_code())
+        "so"
+    };
+    config.runtime.onnxruntime_path = Some(
+        config
+            .model_dir
+            .join(format!("runtime/libonnxruntime.{suffix}")),
+    );
+    config.runtime.pdfium_path = Some(config.model_dir.join(format!("runtime/libpdfium.{suffix}")));
+    if let Ok(value) = std::env::var("FILETWIN_INFERENCE_THREADS") {
+        config.runtime.inference_threads = value
+            .parse()
+            .map_err(|_| Error::invalid("FILETWIN_INFERENCE_THREADS must be an integer"))?;
     }
+    if let Ok(value) = std::env::var("FILETWIN_CUDA_DEVICE") {
+        config.runtime.cuda_device_id = value
+            .parse()
+            .map_err(|_| Error::invalid("FILETWIN_CUDA_DEVICE must be a nonnegative integer"))?;
+    }
+    if let Some(paths) = std::env::var_os("FILETWIN_CUDA_LIBRARY_DIRS") {
+        config.runtime.cuda_library_dirs = std::env::split_paths(&paths)
+            .map(|p| absolute(&p, &cwd))
+            .collect();
+    }
+    let request = EncodeRequest {
+        directory: absolute(&args.directory, &cwd),
+        vectors_file: args.vectors_file.map(|p| absolute(&p, &cwd)),
+        output_file: args.output.map(|p| absolute(&p, &cwd)),
+    };
+    let encoder = Encoder::new(config)?;
+    let cancel = CancellationToken::default();
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ])?;
+    let signal_handle = signals.handle();
+    let interrupted = cancel.clone();
+    let listener = std::thread::spawn(move || {
+        for _ in signals.forever() {
+            interrupted.cancel();
+        }
+    });
+    let result = encoder.encode(&request, &cancel, |p| {
+        if event(&json!({"type":"progress","data":p})).is_err() {
+            cancel.cancel();
+        }
+    });
+    signal_handle.close();
+    let _ = listener.join();
+    let result = result?;
+    if let Some(path) = &request.output_file {
+        write_vectors(path, &result)?;
+    }
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer(&mut output, &result)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(result.exit_code())
+}
+fn main() {
+    let outcome = match Args::try_parse() {
+        Ok(args) => run(args),
+        Err(e)
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = e.print();
+            return;
+        }
+        Err(e) => Err(Error::invalid(e.to_string())),
+    };
+    let code = match outcome {
+        Ok(code) => code,
+        Err(error) => {
+            let _ = event(&json!({"type":"error","error":error}));
+            error.exit_code()
+        }
+    };
+    std::process::exit(code);
 }

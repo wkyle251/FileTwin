@@ -1,123 +1,44 @@
 use crate::{
     Error, ErrorCode, Result,
     api::*,
-    local, matching, profile, scan,
-    store::{self, Job},
+    local::{self, Revision},
+    native, profile,
+    scan::detect_format,
+    vector_file, worker_protocol as protocol,
 };
-use crossbeam_channel::{Receiver, Sender, bounded};
-use fs2::FileExt;
-use rusqlite::Connection;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
-    os::unix::fs::OpenOptionsExt,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
-    },
-    thread::{self, JoinHandle},
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-type DiagnosticSink = Arc<dyn Fn(&Error) + Send + Sync>;
-type Completion = Arc<(Mutex<Option<Result<JobSummary>>>, Condvar)>;
-
-#[derive(Default, Clone)]
-pub struct HostServices {
-    pub diagnostics: Option<DiagnosticSink>,
+/// An immutable configuration, with no catalog, owner lock or background job.
+/// Each encode call owns its temporary worker pool and returns the vectors.
+pub struct Encoder {
+    config: EncoderConfig,
 }
-
-#[derive(Default)]
-pub(crate) struct Cancellation {
-    stopped: AtomicBool,
-    reason: Mutex<Option<Error>>,
-}
-impl Cancellation {
-    pub fn stop(&self, error: Option<Error>) {
-        if let Some(error) = error {
-            let mut reason = self.reason.lock().expect("Cancellation lock");
-            if reason.is_none() {
-                *reason = Some(error);
-            }
-        }
-        self.stopped.store(true, Ordering::Release);
-    }
-    pub fn check(&self) -> Result<()> {
-        if self.stopped.load(Ordering::Acquire) {
-            Err(self
-                .reason
-                .lock()
-                .expect("Cancellation lock")
-                .clone()
-                .unwrap_or_else(|| {
-                    Error::new(ErrorCode::Cancelled, "processing", "Cancellation requested")
-                }))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-pub struct JobHandle {
-    id: String,
-    events: Receiver<JobEvent>,
-    completion: Completion,
-    cancellation: Arc<Cancellation>,
-}
-impl JobHandle {
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-    /// A bounded receiver. Cloned receivers compete for events; they do not broadcast.
-    /// `wait` and the catalog remain authoritative if progress events are coalesced.
-    pub fn events(&self) -> Receiver<JobEvent> {
-        self.events.clone()
-    }
-    pub fn cancel(&self) {
-        self.cancellation.stop(None);
-    }
-    pub fn cancel_for_output_failure(&self) {
-        self.cancellation.stop(Some(Error::new(
-            ErrorCode::OutputClosed,
-            "output",
-            "Caller could not deliver processing output",
-        )));
-    }
-    pub fn is_finished(&self) -> bool {
-        self.completion.0.lock().expect("Completion lock").is_some()
-    }
-    pub fn wait(&self) -> Result<JobSummary> {
-        let (lock, ready) = &*self.completion;
-        let mut value = lock.lock().expect("Completion lock");
-        while value.is_none() {
-            value = ready.wait(value).expect("Completion lock");
-        }
-        value.as_ref().expect("Completed result").clone()
-    }
-}
-
-struct Worker {
-    thread: JoinHandle<()>,
-    cancellation: Arc<Cancellation>,
-    completion: Completion,
-}
-
-/// One processing owner per data directory; one active job per engine. Methods
-/// are thread-safe. The engine owns its worker, even after a handle is dropped.
-pub struct Engine {
-    config: EngineConfig,
-    host: HostServices,
-    owner: Arc<File>,
-    worker: Mutex<Option<Worker>>,
-    lifecycle: AtomicU8,
-}
-impl Engine {
-    pub fn open(mut config: EngineConfig, host: HostServices) -> Result<Self> {
-        if !(1..=64).contains(&config.runtime.inference_threads)
-            || config.runtime.cuda_device_id < 0
+impl Encoder {
+    pub fn new(config: EncoderConfig) -> Result<Self> {
+        if [&config.model_dir, &config.temp_dir]
+            .iter()
+            .any(|p| !p.is_absolute())
         {
             return Err(Error::invalid(
-                "inference_threads must be 1..64 and cuda_device_id must be nonnegative",
+                "Model and temporary directories must be absolute",
+            ));
+        }
+        if !(1..=64).contains(&config.workers)
+            || !(1..=64).contains(&config.runtime.inference_threads)
+            || config.runtime.cuda_device_id < 0
+            || config.memory_bytes == 0
+            || config.staging_bytes == 0
+        {
+            return Err(Error::invalid(
+                "Workers/threads must be 1..64, CUDA device nonnegative, and resource allowances positive",
             ));
         }
         if config
@@ -130,568 +51,535 @@ impl Engine {
                 "CUDA library directories must be absolute existing directories",
             ));
         }
-        for p in [&config.data_dir, &config.model_dir, &config.temp_dir] {
-            if !p.is_absolute() {
-                return Err(Error::invalid("Engine directories must be absolute"));
-            }
+        Ok(Self { config })
+    }
+
+    /// Blocking encoding with callback progress. The host may run this on its
+    /// own thread and share the cancellation token. No host signals are changed.
+    pub fn encode(
+        &self,
+        request: &EncodeRequest,
+        cancel: &CancellationToken,
+        mut progress: impl FnMut(&Progress),
+    ) -> Result<VectorFile> {
+        let root = local::resolve_root(&request.directory)?;
+        if !local::open_secure(&root)?.metadata()?.is_dir() {
+            return Err(Error::invalid("Input must be a directory"));
         }
-        std::fs::create_dir_all(&config.data_dir)?;
-        config.data_dir = std::fs::canonicalize(&config.data_dir)?;
-        let owner = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(config.data_dir.join("owner.lock"))?;
-        FileExt::try_lock_exclusive(&owner).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                Error::new(
-                    ErrorCode::CacheBusy,
-                    "ownership",
-                    "Another engine owns this data directory",
-                )
-            } else {
-                e.into()
+        let mut excluded = Vec::new();
+        let mut cache = HashMap::new();
+        if let Some(path) = &request.vectors_file {
+            let path = local::resolve_root(path)?;
+            let previous = vector_file::read_vectors(&path)?;
+            for file in previous
+                .files
+                .into_iter()
+                .filter(|f| f.state == FileState::Ready)
+            {
+                cache.insert(
+                    (
+                        file.file_id.clone().unwrap(),
+                        file.profile_id.clone().unwrap(),
+                    ),
+                    file,
+                );
             }
-        })?;
-        let db = store::open_writer(&config.data_dir)?;
-        db.execute(
-            "UPDATE jobs SET status='interrupted' WHERE status IN ('queued','running')",
-            [],
-        )?;
-        Ok(Self {
+            excluded.push(path);
+        }
+        if let Some(path) = &request.output_file {
+            let path = local::resolve_root(path)?;
+            vector_file::validate_output(&path)?;
+            excluded.push(path);
+        }
+        // No persistent per-run state: source copies and CoreML compilation
+        // artifacts belong to this private directory and are removed on exit.
+        std::fs::create_dir_all(&self.config.temp_dir)?;
+        let temporary = tempfile::Builder::new()
+            .prefix("filetwin-")
+            .tempdir_in(&self.config.temp_dir)?;
+        let mut config = self.config.clone();
+        config.temp_dir = std::fs::canonicalize(temporary.path())?;
+        excluded.push(config.temp_dir.clone());
+        if config.model_dir.exists() {
+            excluded.push(std::fs::canonicalize(&config.model_dir)?);
+        }
+        if excluded.contains(&root) {
+            return Err(Error::invalid(
+                "Input directory cannot be a model, vector-output or staging artifact",
+            ));
+        }
+        let profiles = profile::experimental_profiles_for(config.backend)
+            .into_iter()
+            .map(|p| (p.family, p.profile_id))
+            .collect();
+        let pool = native::Pool::new(&config);
+        let workers = pool.capacity();
+        let mut run = Run {
             config,
-            host,
-            owner: Arc::new(owner),
-            worker: Mutex::new(None),
-            lifecycle: AtomicU8::new(0),
+            root: root.clone(),
+            excluded,
+            cache,
+            profiles,
+            counts: Counts::default(),
+            records: Vec::new(),
+            pending: (0..workers).map(|_| None).collect(),
+            pool,
+            cancel,
+            progress: &mut progress,
+            started: Instant::now(),
+            last_progress: Instant::now(),
+            stage: Stage::Discovering,
+            discovery_complete: true,
+        };
+        run.emit(true);
+        let result = run.process();
+        let cancelled = match result {
+            Err(e) if e.code == ErrorCode::Cancelled => true,
+            Err(e) => return Err(e),
+            Ok(()) => false,
+        };
+        // Destroy native children before releasing the private staged sources.
+        drop(run.pool);
+        run.records
+            .sort_by_key(|r| r.path.to_path_buf().expect("Generated path"));
+        let summary = Summary {
+            counts: run.counts.clone(),
+            elapsed_seconds: run.started.elapsed().as_secs_f64(),
+            backend: self.config.backend,
+            workers,
+            cancelled,
+        };
+        (run.progress)(&Progress {
+            stage: if cancelled {
+                Stage::Cancelled
+            } else {
+                Stage::Completed
+            },
+            counts: summary.counts.clone(),
+            elapsed_seconds: summary.elapsed_seconds,
+        });
+        Ok(VectorFile {
+            format: VECTOR_FILE_FORMAT.into(),
+            schema_version: SCHEMA_VERSION,
+            directory: FilePath::from_path(&root),
+            complete: !cancelled && run.discovery_complete,
+            files: run.records,
+            summary,
         })
     }
-
-    pub fn submit(&self, request: JobRequest) -> Result<JobHandle> {
-        let mut slot = self.worker.lock().expect("Worker lock");
-        self.prepare_slot(&mut slot)?;
-        let mut request = request.resolve()?;
-        if let Some(sources) = &mut request.sources {
-            for source in sources {
-                let path = local::resolve_root(&source.path()?)?;
-                let file = local::open_secure(&path)?;
-                let meta = file.metadata()?;
-                if !meta.is_file() && !meta.is_dir() {
-                    return Err(Error::invalid(
-                        "Explicit source roots must be regular files or directories",
-                    ));
-                }
-                let resolved = Source::local(path);
-                source.root = resolved.root;
-                source.local_path = resolved.local_path;
-            }
-        }
-        let db = store::open_writer(&self.config.data_dir)?;
-        if let Some(sid) = &request.snapshot_id {
-            let (snapshot_request, _) = store::snapshot_request(&db, sid)?;
-            request.validate_thresholds(
-                snapshot_request
-                    .profiles
-                    .as_ref()
-                    .ok_or_else(|| Error::invalid("Snapshot has no profiles"))?,
-            )?;
-        }
-        prepare_score_input(&db, &mut request)?;
-        let job = store::insert_job(&db, request)?;
-        self.start(&mut slot, job)
-    }
-
-    pub fn resume(&self, id: &str) -> Result<JobHandle> {
-        let mut slot = self.worker.lock().expect("Worker lock");
-        self.prepare_slot(&mut slot)?;
-        let db = store::open_writer(&self.config.data_dir)?;
-        let mut job = store::load_job(&db, id)?;
-        job.request.clone().resolve()?;
-        prepare_score_input(&db, &mut job.request)?;
-        if let Some(sid) = &job.request.snapshot_id {
-            let (request, _) = store::snapshot_request(&db, sid)?;
-            job.request.validate_thresholds(
-                request
-                    .profiles
-                    .as_ref()
-                    .ok_or_else(|| Error::invalid("Snapshot has no profiles"))?,
-            )?;
-        }
-        if !["cancelled", "interrupted"].contains(&job.status.as_str()) {
-            return Err(Error::invalid(
-                "Only cancelled/interrupted jobs can resume; exhausted fixed budgets require a new request",
-            ));
-        }
-        if job
-            .request
-            .limits
-            .as_ref()
-            .and_then(|l| l.wall_time_seconds)
-            .is_some_and(|s| job.elapsed >= s as f64)
-        {
-            return Err(Error::invalid(
-                "This job exhausted its accumulated wall-time allowance",
-            ));
-        }
-        job.attempt += 1;
-        job.status = "queued".into();
-        store::save_job(&db, &job)?;
-        self.start(&mut slot, job)
-    }
-
-    fn prepare_slot(&self, slot: &mut Option<Worker>) -> Result<()> {
-        if self.lifecycle.load(Ordering::Acquire) != 0 {
-            return Err(Error::new(
-                ErrorCode::EngineBusy,
-                "ownership",
-                "This engine is shutting down or already shut down",
-            ));
-        }
-        if slot
-            .as_ref()
-            .is_some_and(|w| w.completion.0.lock().expect("Completion lock").is_none())
-        {
-            return Err(Error::new(
-                ErrorCode::EngineBusy,
-                "ownership",
-                "The engine already has an active job",
-            ));
-        }
-        if let Some(worker) = slot.take() {
-            worker.thread.join().map_err(|_| {
-                Error::new(
-                    ErrorCode::InternalError,
-                    "worker",
-                    "Previous worker panicked",
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    fn start(&self, slot: &mut Option<Worker>, job: Job) -> Result<JobHandle> {
-        let (send, receive) = bounded(64);
-        let completion: Completion = Arc::new((Mutex::new(None), Condvar::new()));
-        let cancel = Arc::new(Cancellation::default());
-        let handle = JobHandle {
-            id: job.id.clone(),
-            events: receive,
-            completion: completion.clone(),
-            cancellation: cancel.clone(),
-        };
-        let cfg = self.config.clone();
-        let host = self.host.clone();
-        let work_cancel = cancel.clone();
-        let owner = self.owner.clone();
-        let worker_completion = completion.clone();
-        send.try_send(JobEvent::Accepted{job_id:job.id.clone(),run_id:job.run.clone(),data:json!({"attempt_id":job.attempt,"status":"queued","resolved_request":job.request,"provenance":{"app_version":env!("CARGO_PKG_VERSION"),"scorer":"filetwin_cosine_f64_v1","encoder_workers":crate::native::worker_count(&job.request),"max_native_workers":crate::native::worker_count(&job.request),"native_worker_policy":"bounded_reusable_processes_per_job","inference_threads":cfg.runtime.inference_threads,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH}})}).expect("Empty event queue");
-        let job_id = job.id.clone();
-        let fallback_job = job.clone();
-        let fallback_config = cfg.clone();
-        let thread = thread::Builder::new()
-            .name("filetwin-engine".into())
-            .spawn(move || {
-                let _owner_guard = owner;
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(cfg, host, job, &work_cancel, &send)
-                }))
-                .unwrap_or_else(|_| {
-                    Err(Error::new(
-                        ErrorCode::InternalError,
-                        "worker",
-                        "The processing worker panicked; committed work remains recoverable",
-                    ))
-                });
-                let summary = result
-                    .unwrap_or_else(|error| failed_terminal(&fallback_config, fallback_job, error));
-                let _ = send.try_send(JobEvent::Summary(Box::new(summary.clone())));
-                *completion.0.lock().expect("Completion lock") = Some(Ok(summary));
-                completion.1.notify_all();
-            })
-            .map_err(|e| {
-                let mut error: Error = e.into();
-                error.details = Box::new(json!({"job_id":job_id}));
-                error
-            })?;
-        *slot = Some(Worker {
-            thread,
-            cancellation: cancel,
-            completion: worker_completion,
-        });
-        Ok(handle)
-    }
-
-    pub fn shutdown(&self) -> Result<()> {
-        match self
-            .lifecycle
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => (),
-            Err(2) => return Ok(()),
-            Err(_) => {
-                return Err(Error::new(
-                    ErrorCode::EngineBusy,
-                    "shutdown",
-                    "Shutdown is already in progress",
-                ));
-            }
-        }
-        let worker = self.worker.lock().expect("Worker lock").take();
-        let mut result = Ok(());
-        if let Some(worker) = worker {
-            worker.cancellation.stop(None);
-            if worker.thread.thread().id() == thread::current().id() {
-                *self.worker.lock().expect("Worker lock") = Some(worker);
-                self.lifecycle.store(0, Ordering::Release);
-                return Err(Error::new(
-                    ErrorCode::EngineBusy,
-                    "shutdown",
-                    "Cancellation requested; a worker callback cannot synchronously join itself",
-                ));
-            }
-            result = worker.thread.join().map_err(|_| {
-                Error::new(ErrorCode::InternalError, "worker", "Worker shutdown failed")
-            });
-        }
-        let unlock = FileExt::unlock(self.owner.as_ref()).map_err(Error::from);
-        self.lifecycle.store(2, Ordering::Release);
-        result.and(unlock)
-    }
-}
-impl Drop for Engine {
-    fn drop(&mut self) {
-        let _ = self.shutdown();
-    }
 }
 
-fn prepare_score_input(db: &Connection, request: &mut JobRequest) -> Result<()> {
-    let Some(run) = &request.source_run_id else {
-        return Ok(());
-    };
-    let source = store::score_run(db, run, request.source_revision)?;
-    if source.summary.completeness.comparison_coverage != "exhaustive_for_snapshot" {
-        return Err(Error::invalid(
-            "group requires an exhaustive saved score revision; incomplete scores can still be queried as a matrix or score pages",
-        ));
-    }
-    if request.pair_scope.is_some() && request.pair_scope != source.request.pair_scope {
-        return Err(Error::invalid(
-            "group cannot change the saved score run's pair scope",
-        ));
-    }
-    let profiles = store::snapshot_request(db, &source.snapshot)?
-        .0
-        .profiles
-        .unwrap_or_default();
-    request.validate_thresholds(&profiles)?;
-    request.source_revision = Some(source.revision);
-    request.pair_scope = source.request.pair_scope;
-    Ok(())
+struct Pending {
+    file: File,
+    path: PathBuf,
+    revision: Revision,
+    record: FileRecord,
 }
-
-/// Even a publication failure produces a terminal outcome for a live caller.
-/// Null result IDs mean no newly published result is promised. If persistence
-/// itself fails, keep that fact explicit and leave crash recovery to the catalog.
-fn failed_terminal(config: &EngineConfig, mut job: Job, mut error: Error) -> JobSummary {
-    let db = store::open_writer(&config.data_dir);
-    if let Ok(db) = &db
-        && let Ok(saved) = store::load_job(db, &job.id)
-    {
-        job = saved;
-    }
-    job.status = "failed".into();
-    let mut summary = JobSummary {
-        job_id: job.id.clone(),
-        run_id: None,
-        attempt_id: job.attempt,
-        status: "failed".into(),
-        resumable: false,
-        snapshot_id: None,
-        result_revision: None,
-        scope_summary: json!({"operation":job.request.operation,"families":job.request.families,"source_count":job.request.sources.as_ref().map(Vec::len)}),
-        started_at: job.started_at.clone(),
-        finished_at: store::now(),
-        elapsed_seconds: job.elapsed,
-        result_bytes_used: job.used,
-        counts: job.counts.clone(),
-        completeness: Completeness {
-            source_coverage: "partial".into(),
-            comparison_coverage: if job.run.is_some() {
-                "partial"
-            } else {
-                "not_run"
-            }
-            .into(),
-            retrieval_mode: job.run.as_ref().map(|_| "exact".into()),
-            limits_reached: vec![],
-            freshness: "unpublished".into(),
-        },
-        error: Some(error.clone()),
-    };
-    let persisted = db.and_then(|db| store::save_summary(&db, &job, &summary));
-    if let Err(persistence) = persisted {
-        error.details = Box::new(
-            json!({"terminal_state_persisted":false,"persistence_error":persistence.message}),
-        );
-        summary.error = Some(error);
-    }
-    summary
-}
-
-pub(crate) struct Work<'a> {
-    pub db: Connection,
-    pub config: EngineConfig,
-    pub job: Job,
-    pub cancel: &'a Cancellation,
-    events: &'a Sender<JobEvent>,
-    host: HostServices,
-    start: Instant,
-    previous_elapsed: f64,
+struct Run<'a> {
+    config: EncoderConfig,
+    root: PathBuf,
+    excluded: Vec<PathBuf>,
+    cache: HashMap<(String, String), FileRecord>,
+    profiles: BTreeMap<String, String>,
+    counts: Counts,
+    records: Vec<FileRecord>,
+    pool: native::Pool,
+    pending: Vec<Option<Pending>>,
+    cancel: &'a CancellationToken,
+    progress: &'a mut dyn FnMut(&Progress),
+    started: Instant,
     last_progress: Instant,
-    last_heartbeat: std::cell::Cell<Instant>,
+    stage: Stage,
+    discovery_complete: bool,
 }
-impl Work<'_> {
-    pub fn check(&self) -> Result<()> {
-        self.cancel.check()?;
-        if self.last_heartbeat.get().elapsed() >= Duration::from_millis(250) {
-            self.db.execute(
-                "UPDATE jobs SET elapsed=?2,updated_at=?3 WHERE id=?1",
-                rusqlite::params![self.job.id, self.elapsed(), store::now()],
-            )?;
-            let _=self.events.try_send(JobEvent::Progress{job_id:self.job.id.clone(),run_id:self.job.run.clone(),data:json!({"attempt_id":self.job.attempt,"stage":self.job.stage,"counts":self.job.counts,"elapsed_seconds":self.elapsed(),"bytes_transferred":0,"eta_seconds":null})});
-            self.last_heartbeat.set(Instant::now());
-        }
-        if self
-            .job
-            .request
-            .limits
-            .as_ref()
-            .and_then(|l| l.wall_time_seconds)
-            .is_some_and(|limit| self.elapsed() >= limit as f64)
-        {
-            return Err(Error::new(
-                ErrorCode::BudgetExhausted,
-                "processing",
-                "Accumulated wall-time allowance exhausted; start a new job to change limits",
-            ));
-        }
-        Ok(())
-    }
-    pub fn elapsed(&self) -> f64 {
-        self.previous_elapsed + self.start.elapsed().as_secs_f64()
-    }
-    pub fn charge(&mut self, bytes: u64) -> Result<()> {
-        let limit = self
-            .job
-            .request
-            .limits
-            .as_ref()
-            .and_then(|l| l.result_bytes)
-            .expect("Resolved result budget");
-        if bytes > limit.saturating_sub(self.job.used) {
-            return Err(Error::new(
-                ErrorCode::BudgetExhausted,
-                "results",
-                "Encoded result-record budget exhausted; start a new job to change limits",
-            ));
-        }
-        self.job.used += bytes;
-        Ok(())
-    }
-    pub fn checkpoint(&mut self) -> Result<()> {
-        self.job.elapsed = self.elapsed();
-        store::save_job(&self.db, &self.job)?;
-        if self.last_progress.elapsed() >= Duration::from_millis(250) {
-            let _=self.events.try_send(JobEvent::Progress{job_id:self.job.id.clone(),run_id:self.job.run.clone(),data:json!({"attempt_id":self.job.attempt,"stage":self.job.stage,"counts":self.job.counts,"elapsed_seconds":self.job.elapsed,"bytes_transferred":0,"eta_seconds":null})});
+
+impl Run<'_> {
+    fn emit(&mut self, force: bool) {
+        if force || self.last_progress.elapsed() >= Duration::from_millis(250) {
+            (self.progress)(&Progress {
+                stage: self.stage,
+                counts: self.counts.clone(),
+                elapsed_seconds: self.started.elapsed().as_secs_f64(),
+            });
             self.last_progress = Instant::now();
         }
-        Ok(())
     }
-    pub fn file_error(&mut self, error: Error) -> Result<()> {
-        store::error(&self.db, &self.job, &error)?;
-        if let Some(sink) = &self.host.diagnostics {
-            sink(&error);
-        }
-        let _ = self.events.try_send(JobEvent::Error {
-            job_id: self.job.id.clone(),
-            run_id: self.job.run.clone(),
-            error,
-        });
-        Ok(())
+    fn check(&mut self) -> Result<()> {
+        self.emit(false);
+        self.cancel.check()
     }
-}
 
-fn run(
-    config: EngineConfig,
-    host: HostServices,
-    job: Job,
-    cancel: &Cancellation,
-    events: &Sender<JobEvent>,
-) -> Result<JobSummary> {
-    let previous_elapsed = job.elapsed;
-    let mut work = Work {
-        db: store::open_writer(&config.data_dir)?,
-        config,
-        job,
-        cancel,
-        events,
-        host,
-        start: Instant::now(),
-        previous_elapsed,
-        last_progress: Instant::now(),
-        last_heartbeat: std::cell::Cell::new(Instant::now()),
-    };
-    work.job.status = "running".into();
-    work.checkpoint()?;
-    let outcome = (|| -> Result<()> {
-        if work.job.request.operation.uses_saved_input() && work.job.snapshot.is_none() {
-            work.job.snapshot = if work.job.request.operation == Operation::Group {
-                Some(
-                    store::score_run(
-                        &work.db,
-                        work.job
-                            .request
-                            .source_run_id
-                            .as_deref()
-                            .expect("Score run"),
-                        work.job.request.source_revision,
-                    )?
-                    .snapshot,
+    fn blank(&self, path: &Path) -> FileRecord {
+        FileRecord {
+            path: FilePath::from_path(path.strip_prefix(&self.root).expect("Child path")),
+            file_id: None,
+            bytes: None,
+            state: FileState::Failed,
+            family: None,
+            profile_id: None,
+            vector: None,
+            vector_sha256: None,
+            reused: false,
+            error: None,
+            extraction: None,
+        }
+    }
+    fn failed(&mut self, path: &Path, error: Error, skipped: bool) {
+        let mut record = self.blank(path);
+        record.state = if skipped {
+            FileState::Skipped
+        } else {
+            FileState::Failed
+        };
+        record.error = Some(error);
+        self.record(record);
+    }
+    fn record(&mut self, record: FileRecord) {
+        self.counts.files_processed += 1;
+        match record.state {
+            FileState::Ready => {
+                self.counts.files_ready += 1;
+                if record.reused {
+                    self.counts.cache_hits += 1;
+                } else {
+                    self.counts.vectors_encoded += 1;
+                }
+                self.cache.insert(
+                    (
+                        record.file_id.clone().unwrap(),
+                        record.profile_id.clone().unwrap(),
+                    ),
+                    record.clone(),
+                );
+            }
+            FileState::Skipped => self.counts.files_skipped += 1,
+            _ => self.counts.files_failed += 1,
+        }
+        self.records.push(record);
+        self.emit(false);
+    }
+
+    fn process(&mut self) -> Result<()> {
+        let mut directories = vec![self.root.clone()];
+        let mut files = Vec::new();
+        let mut visited = HashSet::new();
+        while let Some(path) = directories.pop() {
+            self.check()?;
+            let listing = (|| -> Result<local::SecureDir> {
+                let m = local::open_secure(&path)?.metadata()?;
+                let r = Revision::of(&m);
+                if !visited.insert((r.device, r.inode)) {
+                    return Err(Error::invalid("Directory was already visited"));
+                }
+                local::SecureDir::open(&path)
+            })();
+            let listing = match listing {
+                Ok(v) => v,
+                Err(e) if path != self.root => {
+                    self.discovery_complete = false;
+                    self.counts.files_discovered += 1;
+                    self.failed(&path, e, false);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            for entry in listing {
+                self.check()?;
+                let child = path.join(entry?);
+                if self.excluded.iter().any(|p| child.starts_with(p)) {
+                    continue;
+                }
+                let meta = std::fs::symlink_metadata(&child);
+                match meta {
+                    Ok(m) if m.is_dir() => directories.push(child),
+                    Ok(m) if m.is_file() => {
+                        self.counts.files_discovered += 1;
+                        files.push(child);
+                    }
+                    Ok(_) => {
+                        self.counts.files_discovered += 1;
+                        self.failed(
+                            &child,
+                            Error::new(
+                                ErrorCode::UnsupportedFormat,
+                                "discovery",
+                                "Symlinks and nonregular entries are not followed",
+                            ),
+                            true,
+                        );
+                    }
+                    Err(e) => {
+                        self.counts.files_discovered += 1;
+                        self.failed(&child, e.into(), false);
+                    }
+                }
+            }
+        }
+        files.sort();
+        self.counts.files_total = Some(self.counts.files_discovered);
+        self.stage = Stage::Encoding;
+        self.emit(true);
+        for path in files {
+            self.check()?;
+            self.drain()?;
+            if let Err(e) = self.encode_file(&path) {
+                if e.code == ErrorCode::Cancelled {
+                    return Err(e);
+                }
+                self.failed(&path, e, false);
+            }
+        }
+        while self.pool.active() > 0 {
+            self.wait_one()?;
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        while let Some((slot, outcome)) = self.pool.poll() {
+            self.finish(slot, outcome)?;
+        }
+        Ok(())
+    }
+    fn wait_one(&mut self) -> Result<()> {
+        loop {
+            self.check()?;
+            if let Some((slot, outcome)) = self.pool.poll() {
+                return self.finish(slot, outcome);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn finish(&mut self, slot: usize, outcome: native::Outcome) -> Result<()> {
+        self.check()?;
+        let context = self.pending[slot].take().expect("Pending source");
+        self.finish_record(context, outcome);
+        Ok(())
+    }
+    fn finish_record(&mut self, mut context: Pending, outcome: native::Outcome) {
+        if !local::still_current(&context.file, &context.path, &context.revision) {
+            context.record.file_id = None;
+            context.record.error = Some(Error::new(
+                ErrorCode::SourceChanged,
+                "validation",
+                "Source changed during encoding; vector discarded",
+            ));
+        } else {
+            match outcome {
+                Ok(encoded) => {
+                    context.record.state = FileState::Ready;
+                    context.record.profile_id = Some(self.profiles[&encoded.family].clone());
+                    context.record.family = Some(encoded.family);
+                    context.record.vector_sha256 =
+                        Some(profile::digest_hex(&profile::vector_bytes(&encoded.vector)));
+                    context.record.vector = Some(encoded.vector);
+                    context.record.extraction = Some(encoded.extraction);
+                }
+                Err(e) => {
+                    if e.code == ErrorCode::UnsupportedFormat {
+                        context.record.state = FileState::Unsupported;
+                    }
+                    context.record.error = Some(e);
+                }
+            }
+        }
+        self.record(context.record);
+    }
+
+    fn encode_file(&mut self, path: &Path) -> Result<()> {
+        let mut file = local::open_secure(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(Error::new(
+                ErrorCode::SourceChanged,
+                "discovery",
+                "Entry is no longer a regular file",
+            ));
+        }
+        let revision = Revision::of(&meta);
+        let mut prefix = [0u8; 512];
+        let n = file.read(&mut prefix)?;
+        self.counts.bytes_read += n as u64;
+        file.seek(SeekFrom::Start(0))?;
+        let (family, format) = detect_format(&prefix[..n], path);
+        let is_native = format != "utf8" && family != "unknown";
+        let mut staged = if is_native {
+            let reservation = revision
+                .bytes
+                .saturating_add(2 * protocol::MAX_RESPONSE as u64);
+            while self.pool.active() == self.pool.capacity()
+                || (self.pool.active() > 0
+                    && self.pool.staged_bytes().saturating_add(reservation)
+                        > self.config.staging_bytes)
+            {
+                self.wait_one()?;
+            }
+            Some(tempfile::NamedTempFile::new_in(&self.config.temp_dir)?)
+        } else {
+            None
+        };
+        let source_limit = self.config.staging_bytes.saturating_sub(
+            self.pool
+                .staged_bytes()
+                .saturating_add(2 * protocol::MAX_RESPONSE as u64),
+        );
+        // Hash every readable original. An oversized native file still gets a
+        // content identifier even though its source copy cannot be admitted.
+        let mut stage_overflow = staged.is_some() && revision.bytes > source_limit;
+        if stage_overflow {
+            staged = None;
+        }
+        let mut hash = Sha256::new();
+        let mut bytes = 0u64;
+        let mut buffer = [0u8; 65536];
+        loop {
+            self.check()?;
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+            bytes += n as u64;
+            self.counts.bytes_read += n as u64;
+            self.counts.bytes_hashed += n as u64;
+            if staged.is_some() && bytes > source_limit {
+                staged = None;
+                stage_overflow = true;
+            }
+            if let Some(copy) = &mut staged {
+                copy.write_all(&buffer[..n])?;
+            }
+        }
+        let mut record = self.blank(path);
+        record.file_id = Some(format!("sha256:{:x}", hash.finalize()));
+        record.bytes = Some(bytes);
+        record.family = (family != "unknown").then(|| family.into());
+        let mut context = Pending {
+            file,
+            path: path.to_owned(),
+            revision,
+            record,
+        };
+        if !local::still_current(&context.file, path, &context.revision) {
+            self.finish_record(
+                context,
+                Err(Error::new(
+                    ErrorCode::SourceChanged,
+                    "validation",
+                    "Source changed while hashing",
+                )),
+            );
+            return Ok(());
+        }
+        // Wait for an identical input already being encoded in this call.
+        while self
+            .pending
+            .iter()
+            .flatten()
+            .any(|p| p.record.file_id == context.record.file_id)
+        {
+            self.wait_one()?;
+        }
+        let candidates = if format == "media" {
+            vec!["audio", "video"]
+        } else {
+            vec![family]
+        };
+        let hit = candidates.into_iter().find_map(|family| {
+            self.profiles
+                .get(family)
+                .and_then(|id| {
+                    self.cache
+                        .get(&(context.record.file_id.clone().unwrap(), id.clone()))
+                })
+                .cloned()
+        });
+        if let Some(mut hit) = hit {
+            if !local::still_current(&context.file, path, &context.revision) {
+                self.finish_record(
+                    context,
+                    Err(Error::new(
+                        ErrorCode::SourceChanged,
+                        "validation",
+                        "Source changed before vector reuse",
+                    )),
+                );
+            } else {
+                hit.path = context.record.path;
+                hit.bytes = context.record.bytes;
+                hit.reused = true;
+                self.record(hit);
+            }
+            return Ok(());
+        }
+        if family == "unknown" || stage_overflow {
+            let e = if stage_overflow {
+                Error::new(
+                    ErrorCode::ResourceBudgetTooSmall,
+                    "staging",
+                    "File exceeds the private staging allowance",
                 )
             } else {
-                work.job.request.snapshot_id.clone()
+                Error::new(
+                    ErrorCode::UnsupportedFormat,
+                    "encoding",
+                    "No content reader for this format",
+                )
             };
-            let (_, partial) = store::snapshot_request(
-                &work.db,
-                work.job.snapshot.as_ref().expect("Compare snapshot"),
-            )?;
-            work.job.source_partial = partial;
-            store::create_run(&work.db, &mut work.job)?;
+            self.finish_record(context, Err(e));
+            return Ok(());
         }
-        work.check()?;
-        if work.job.stage == "discovery" {
-            scan::discover(&mut work)?;
-            store::publish_snapshot(&work.db, &mut work.job)?;
-            if work.job.request.operation != Operation::Index {
-                store::create_run(&work.db, &mut work.job)?;
-            }
+        if format == "utf8" {
+            context.file.seek(SeekFrom::Start(0))?;
+            let result = crate::text::encode(&mut context.file, false, &mut || self.check());
+            let encoded = match result {
+                Ok(e) => {
+                    self.counts.bytes_read += e.bytes_read;
+                    Ok(protocol::Encoded {
+                        family: "text".into(),
+                        format: "text/plain; charset=utf-8".into(),
+                        vector: e.vector,
+                        extraction: json!({"coverage":"complete_source_text","characters":e.characters}),
+                    })
+                }
+                Err(e) if e.code == ErrorCode::Cancelled => return Err(e),
+                Err(e) => {
+                    self.counts.bytes_read += e.details["bytes_read"].as_u64().unwrap_or(0);
+                    Err(e)
+                }
+            };
+            self.finish_record(context, encoded);
+            return Ok(());
         }
-        if work.job.run.is_some() {
-            if work.job.request.operation == Operation::Group {
-                matching::filter_scores(&mut work)?;
-            } else {
-                matching::compare(&mut work)?;
-            }
-            if work
-                .job
-                .request
-                .matching
-                .as_ref()
-                .is_some_and(|m| m.grouping == "all_pairs")
-            {
-                matching::group(&mut work)?;
-            }
+        if let Err(e) = native::validate_runtime(&self.config, family, format) {
+            self.finish_record(context, Err(e));
+            return Ok(());
         }
+        let id = if format == "media" {
+            self.profiles["video"].clone()
+        } else {
+            self.profiles[family].clone()
+        };
+        let copy = staged.as_mut().expect("Admitted source copy");
+        copy.flush()?;
+        let request = protocol::Request {
+            version: protocol::VERSION,
+            path: copy.path().to_owned(),
+            format: format.into(),
+            profile_id: id,
+            profiles: self.profiles.clone(),
+            model_dir: self.config.model_dir.clone(),
+            runtime: self.config.runtime.clone(),
+            memory_bytes: self.config.memory_bytes,
+            parent_pid: std::process::id(),
+            inference_cache_dir: Some(self.config.temp_dir.join("inference-cache")),
+        };
+        let slot = self.pool.submit(native::Prepared {
+            request,
+            bytes,
+            _staged: staged.unwrap(),
+        });
+        self.pending[slot] = Some(context);
         Ok(())
-    })();
-    let error = outcome.err();
-    work.job.status = match error.as_ref().map(|e| e.code) {
-        None => "completed",
-        Some(ErrorCode::Cancelled | ErrorCode::OutputClosed) => "cancelled",
-        Some(ErrorCode::BudgetExhausted) => "checkpointed",
-        Some(_) => "failed",
     }
-    .into();
-    if let Some(e) = &error {
-        store::error(&work.db, &work.job, e)?;
-    }
-    if work.job.stage == "discovery"
-        && work.job.status != "completed"
-        && !work.job.request.operation.uses_saved_input()
-    {
-        work.job.source_partial = true;
-        store::publish_snapshot(&work.db, &mut work.job)?;
-    }
-    work.job.elapsed = work.elapsed();
-    let revision = if let Some(run) = &work.job.run {
-        work.db.query_row(
-            "SELECT coalesce(max(revision),0)+1 FROM publications WHERE run_id=?1",
-            [run],
-            |r| r.get::<_, u64>(0),
-        )?
-    } else {
-        1
-    };
-    let selected = if let Some(sid) = &work.job.snapshot {
-        store::snapshot_request(&work.db, sid)?
-            .0
-            .profiles
-            .unwrap_or_default()
-    } else {
-        work.job.request.profiles.clone().unwrap_or_default()
-    };
-    let selected_profiles: Vec<_> = selected.values().map(|id| profile::find(id).map(|p|
-        json!({"profile_id":p.profile_id,"family":p.family,"status":p.status,"calibration_status":p.calibration_status}))).collect::<Result<_>>()?;
-    let summary = JobSummary {
-        job_id: work.job.id.clone(),
-        run_id: work.job.run.clone(),
-        attempt_id: work.job.attempt,
-        status: work.job.status.clone(),
-        resumable: work.job.status == "cancelled"
-            && !work
-                .job
-                .request
-                .limits
-                .as_ref()
-                .and_then(|l| l.wall_time_seconds)
-                .is_some_and(|limit| work.job.elapsed >= limit as f64),
-        snapshot_id: work.job.snapshot.clone(),
-        result_revision: work.job.snapshot.as_ref().map(|_| revision),
-        scope_summary: json!({"families":selected.keys().collect::<Vec<_>>(),"profiles":selected_profiles,"pair_scope":work.job.request.pair_scope,"matching":work.job.request.matching,"source_run_id":work.job.request.source_run_id,"source_revision":work.job.request.source_revision}),
-        started_at: work.job.started_at.clone(),
-        finished_at: store::now(),
-        elapsed_seconds: work.job.elapsed,
-        result_bytes_used: work.job.used,
-        counts: work.job.counts.clone(),
-        completeness: Completeness {
-            source_coverage: if work.job.source_partial {
-                "partial"
-            } else {
-                "complete_for_requested_profiles"
-            }
-            .into(),
-            comparison_coverage: if work.job.run.is_none() {
-                "not_run"
-            } else if error.is_none() {
-                "exhaustive_for_snapshot"
-            } else {
-                "partial"
-            }
-            .into(),
-            retrieval_mode: work.job.run.as_ref().map(|_| "exact".into()),
-            limits_reached: if error
-                .as_ref()
-                .is_some_and(|e| e.code == ErrorCode::BudgetExhausted)
-            {
-                vec![error.as_ref().expect("Budget error").stage.clone()]
-            } else {
-                vec![]
-            },
-            freshness: if work.job.request.operation.uses_saved_input() {
-                "snapshot_observation"
-            } else {
-                "fast_metadata_heuristic"
-            }
-            .into(),
-        },
-        error,
-    };
-    if work.job.run.is_some() {
-        matching::publish(&work, &summary)?;
-    }
-    store::save_summary(&work.db, &work.job, &summary)?;
-    Ok(summary)
 }
