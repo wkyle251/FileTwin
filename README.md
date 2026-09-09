@@ -5,6 +5,10 @@ CLI, JSON/JSONL output for other applications, and the `filetwin-core` Rust
 library. It indexes content, saves immutable snapshots, and can retain every
 compatible pairwise score for matrix output and later filtering/grouping.
 
+**License: PolyForm Noncommercial 1.0.0.** Personal, educational and other
+permitted noncommercial uses are allowed. Commercial use outside the license's
+explicit permissions requires a separate written license. See [License](#license).
+
 **Status: all four encoding families implemented, developer preview 0.1.0-dev.**
 Profiles remain experimental. `--all-scores` needs no cutoff; grouping requires
 explicit thresholds, which are not accuracy percentages. Unsupported formats
@@ -728,3 +732,40 @@ python3 scripts/format-smoke.py target/release/filetwin --model-dir .filetwin/mo
 Regenerate schemas by omitting `--check` from the schema command. See the
 [validation record](implementation-plan.md#validation-record) for completed
 checks and remaining release gates.
+
+## License
+
+FileTwin's original source code, scripts, examples and documentation are licensed
+under the [PolyForm Noncommercial License 1.0.0](LICENSE)
+(`PolyForm-Noncommercial-1.0.0`). This applies to the CLI, `filetwin-core` Rust
+library, companion worker and their compiled binaries.
+
+| Example use | Permission |
+| --- | --- |
+| Organizing your own files, personal study, or a hobby project with no anticipated commercial application | Allowed under the license. |
+| Classroom teaching, student projects, or noncommercial academic research | Allowed under the license. |
+| Modifying FileTwin for a permitted purpose, or sharing copies and permitted modifications | Allowed subject to the license, including its notice requirements. |
+| Using FileTwin in a paid or advertising-funded app, a commercial hosted service, paid client work, or a company's internal business operations | Requires a separate written license unless an explicit permitted purpose in the license applies. |
+
+The license also explicitly permits use by charitable organizations, educational
+institutions, public research organizations, public safety or health organizations,
+environmental protection organizations, and government institutions, regardless
+of their funding source or obligations resulting from that funding. The table is
+a practical summary; the complete [LICENSE](LICENSE) controls these permissions.
+
+Calling the CLI from another application or embedding the Rust library is still
+use of FileTwin under these terms. Making an app free to download does not by
+itself make its business use noncommercial. For use outside the permitted
+purposes, request a separate written license from the copyright holder through
+the [FileTwin repository](https://github.com/wkyle251/FileTwin).
+
+FileTwin is **source-available with a noncommercial license**. It does not meet
+the [Open Source Definition](https://opensource.org/osd), which requires allowing
+commercial use.
+
+When redistributing, include the license text or its official URL and the
+`Required Notice:` copyright line from [LICENSE](LICENSE). Dependencies, model
+weights, native runtimes and external test fixtures remain subject to their own
+licenses; this license does not replace their terms or grant rights to input
+files. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and preserve the relevant
+upstream notices when distributing a bundle.

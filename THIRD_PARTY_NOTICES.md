@@ -1,5 +1,10 @@
 # Native encoding components
 
+FileTwin's original code is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). Third-party dependencies, model
+weights, native runtimes and external test fixtures retain their own licenses.
+FileTwin's license does not relicense those components or replace their notices.
+
 FileTwin's developer setup downloads artifacts only when explicitly requested.
 Keep these notices and the downloaded artifact licenses when distributing a
 native bundle. Rust dependency licenses are recorded by each dependency crate.
